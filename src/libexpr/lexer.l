@@ -20,15 +20,8 @@ using namespace nix;
 
 namespace nix {
 
-#define YY_USER_INIT initLoc(yylloc, yyscanner)
-#define YY_USER_ACTION adjustLoc(yylloc, yytext, yyleng);
 
-#define PUSH_STATE(state) yy_push_state(state, yyscanner)
-#define POP_STATE() yy_pop_state(yyscanner)
-#define TOP_STATE() yy_top_state(yyscanner)
-
-
-static void initLoc(YYLTYPE * loc, yyscan_t yyscanner)
+static void initLoc(YYLTYPE * loc)
 {
     loc->first_line = loc->last_line = 1;
     loc->first_column = loc->last_column = 1;
@@ -80,7 +73,15 @@ static Expr * unescapeStr(SymbolTable & symbols, const char * s)
     return new ExprString(symbols.create(t));
 }
 
+
 }
+
+#define YY_USER_INIT initLoc(yylloc)
+#define YY_USER_ACTION adjustLoc(yylloc, yytext, yyleng);
+
+#define PUSH_STATE(state) yy_push_state(state, yyscanner)
+#define POP_STATE() yy_pop_state(yyscanner)
+#define TOP_STATE() yy_top_state(yyscanner)
 
 %}
 
@@ -145,13 +146,14 @@ or          { return OR_KW; }
 
 \$\{        { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
 
-\}      { // Do no pop beside the end of the stack.
-          // If we reach such an illegal '}',
-          // we pass it to the parser for it to choke on.
-          if (TOP_STATE() != FAILED) POP_STATE();
-          return '}';
-        }
-\{      { PUSH_STATE(INITIAL); return '{'; }
+\{          { PUSH_STATE(INITIAL); return '{'; }
+\}          { /* Do not pop() beside the end of the stack.
+                 If we reach such an illegal '}', we pass it to the parser
+                 and remain in the INITIAL state. */
+              if (TOP_STATE() != FAILED)
+                  POP_STATE();
+              return '}';
+            }
 
 \"          { PUSH_STATE(STRING); return '"'; }
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)*\$/\" |
