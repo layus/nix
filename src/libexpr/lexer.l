@@ -3,12 +3,12 @@
 %option never-interactive
 %option stack
 %option nodefault
-%option nounput noyy_top_state
+%option nounput
 
 
+%x FAILED
 %x STRING
 %x IND_STRING
-%x INSIDE_DOLLAR_CURLY
 %x IND_STRING_INDENT
 
 
@@ -20,8 +20,15 @@ using namespace nix;
 
 namespace nix {
 
+#define YY_USER_INIT initLoc(yylloc, yyscanner)
+#define YY_USER_ACTION adjustLoc(yylloc, yytext, yyleng);
 
-static void initLoc(YYLTYPE * loc)
+#define PUSH_STATE(state) yy_push_state(state, yyscanner)
+#define POP_STATE() yy_pop_state(yyscanner)
+#define TOP_STATE() yy_top_state(yyscanner)
+
+
+static void initLoc(YYLTYPE * loc, yyscan_t yyscanner)
 {
     loc->first_line = loc->last_line = 1;
     loc->first_column = loc->last_column = 1;
@@ -73,14 +80,7 @@ static Expr * unescapeStr(SymbolTable & symbols, const char * s)
     return new ExprString(symbols.create(t));
 }
 
-
 }
-
-#define YY_USER_INIT initLoc(yylloc)
-#define YY_USER_ACTION adjustLoc(yylloc, yytext, yyleng);
-
-#define PUSH_STATE(state) yy_push_state(state, yyscanner)
-#define POP_STATE() yy_pop_state(yyscanner)
 
 %}
 
@@ -96,8 +96,16 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
 
 %%
 
-<INITIAL,INSIDE_DOLLAR_CURLY>{
+%{
 
+/* Insert a dummy "FAILED" state at the bottom of the stack.
+ * This allows to detect and handle unbalanced expression
+ * without throwing a fatal error (flex default).
+ */
+BEGIN(FAILED);
+PUSH_STATE(INITIAL);
+
+%}
 
 if          { return IF; }
 then        { return THEN; }
@@ -135,15 +143,17 @@ or          { return OR_KW; }
               return FLOAT;
             }
 
-\$\{        { PUSH_STATE(INSIDE_DOLLAR_CURLY); return DOLLAR_CURLY; }
-}
+\$\{        { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
 
-\}                           { return '}'; }
-<INSIDE_DOLLAR_CURLY>\}      { POP_STATE(); return '}'; }
-\{                           { return '{'; }
-<INSIDE_DOLLAR_CURLY>\{      { PUSH_STATE(INSIDE_DOLLAR_CURLY); return '{'; }
+\}      { // Do no pop beside the end of the stack.
+          // If we reach such an illegal '}',
+          // we pass it to the parser for it to choke on.
+          if (TOP_STATE() != FAILED) POP_STATE();
+          return '}';
+        }
+\{      { PUSH_STATE(INITIAL); return '{'; }
 
-<INITIAL,INSIDE_DOLLAR_CURLY>\"          { PUSH_STATE(STRING); return '"'; }
+\"          { PUSH_STATE(STRING); return '"'; }
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)*\$/\" |
 <STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)+ {
               /* It is impossible to match strings ending with '$' with one
@@ -152,11 +162,10 @@ or          { return OR_KW; }
               yylval->e = unescapeStr(data->symbols, yytext);
               return STR;
             }
-<STRING>\$\{  { PUSH_STATE(INSIDE_DOLLAR_CURLY); return DOLLAR_CURLY; }
+<STRING>\$\{  { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
 <STRING>\"  { POP_STATE(); return '"'; }
 <STRING>.   return yytext[0]; /* just in case: shouldn't be reached */
 
-<INITIAL,INSIDE_DOLLAR_CURLY>\'\'(\ *\n)?     { PUSH_STATE(IND_STRING); return IND_STRING_OPEN; }
 \'\'(\ *\n)?     {
                    PUSH_STATE(IND_STRING);
                    PUSH_STATE(IND_STRING_INDENT);
@@ -186,7 +195,7 @@ or          { return OR_KW; }
                    yylval->e = unescapeStr(data->symbols, yytext + 2);
                    return IND_STR;
                  }
-<IND_STRING>\$\{ { PUSH_STATE(INSIDE_DOLLAR_CURLY); return DOLLAR_CURLY; }
+<IND_STRING>\$\{ { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
 <IND_STRING>\'\' { POP_STATE(); return IND_STRING_CLOSE; }
 <IND_STRING>\'   {
                    yylval->e = new ExprIndStr("'");
@@ -195,7 +204,6 @@ or          { return OR_KW; }
 <IND_STRING>\n   { PUSH_STATE(IND_STRING_INDENT); return '\n'; }
 <IND_STRING>.    return yytext[0]; /* just in case: shouldn't be reached */
 
-<INITIAL,INSIDE_DOLLAR_CURLY>{
 
 {PATH}      { yylval->path = strdup(yytext); return PATH; }
 {HPATH}     { yylval->path = strdup(yytext); return HPATH; }
@@ -207,8 +215,6 @@ or          { return OR_KW; }
 \/\*([^*]|\*[^\/])*\*\/  /* long comments */
 
 .           return yytext[0];
-
-}
 
 <<EOF>> { data->atEnd = true; return 0; }
 
