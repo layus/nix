@@ -3,10 +3,10 @@
 %option never-interactive
 %option stack
 %option nodefault
-%option nounput
+%option nounput noyy_top_state
 
 
-%x FAILED
+%s DEFAULT
 %x STRING
 %x IND_STRING
 %x IND_STRING_INDENT
@@ -97,16 +97,6 @@ URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~
 
 %%
 
-%{
-
-/* Insert a dummy "FAILED" state at the bottom of the stack.
- * This allows to detect and handle unbalanced expression
- * without throwing a fatal error (flex default).
- */
-BEGIN(FAILED);
-PUSH_STATE(INITIAL);
-
-%}
 
 if          { return IF; }
 then        { return THEN; }
@@ -144,67 +134,82 @@ or          { return OR_KW; }
               return FLOAT;
             }
 
-\$\{        { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
+\$\{        { PUSH_STATE(DEFAULT); return DOLLAR_CURLY; }
 
-\{          { PUSH_STATE(INITIAL); return '{'; }
+\{          { PUSH_STATE(DEFAULT); return '{'; }
 \}          { /* Do not pop() beside the end of the stack.
                  If we reach such an illegal '}', we pass it to the parser
-                 and remain in the INITIAL state. */
-              if (TOP_STATE() != FAILED)
+                 and remain in the DEFAULT state. */
+              if (YYSTATE != INITIAL)
                   POP_STATE();
               return '}';
             }
 
 \"          { PUSH_STATE(STRING); return '"'; }
-<STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)*\$/\" |
-<STRING>([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)+ {
+
+\'\'(\ *\n)? {
+              PUSH_STATE(IND_STRING);
+              PUSH_STATE(IND_STRING_INDENT);
+              return IND_STRING_OPEN;
+            }
+
+<STRING>{ /* matches only within double-quoted strings (") */
+
+([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)*\$/\" |
+([^\$\"\\]|\$[^\{\"\\]|\\.|\$\\.)+ {
               /* It is impossible to match strings ending with '$' with one
                  regex because trailing contexts are only valid at the end
                  of a rule. (A sane but undocumented limitation.) */
               yylval->e = unescapeStr(data->symbols, yytext);
               return STR;
             }
-<STRING>\$\{  { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
-<STRING>\"  { POP_STATE(); return '"'; }
-<STRING>.   return yytext[0]; /* just in case: shouldn't be reached */
+\$\{        { PUSH_STATE(DEFAULT); return DOLLAR_CURLY; }
+\"          { POP_STATE(); return '"'; }
+.           return yytext[0]; /* just in case: shouldn't be reached */
 
-\'\'(\ *\n)?     {
-                   PUSH_STATE(IND_STRING);
-                   PUSH_STATE(IND_STRING_INDENT);
-                   return IND_STRING_OPEN;
-                 }
-<IND_STRING_INDENT>" "*/[^ ] {
-                   POP_STATE();
-                   yylval->e = new ExprIndStr(yytext);
-                   return IND_STR_INDENT;
-                 }
-<IND_STRING_INDENT>. return yytext[0]; /* just in case: shouldn't be reached */
-<IND_STRING>([^\$\'\n]|\$[^\{\'\n]|\'[^\'\$\n])*\$/[\'\n] |
-<IND_STRING>([^\$\'\n]|\$[^\{\'\n]|\'[^\'\$\n])+ {
-                   yylval->e = new ExprIndStr(yytext);
-                   return IND_STR;
-                 }
-<IND_STRING>\'\'\$ {
-                   yylval->e = new ExprIndStr("$");
-                   return IND_STR;
-                 }
-<IND_STRING>\'\'\' {
-                   yylval->e = new ExprIndStr("''");
-                   return IND_STR;
-                 }
-<IND_STRING>\'\'\\/\n /* Ignore the escape sequence as it is useless. */
-<IND_STRING>\'\'\\. {
-                   yylval->e = unescapeStr(data->symbols, yytext + 2);
-                   return IND_STR;
-                 }
-<IND_STRING>\$\{ { PUSH_STATE(INITIAL); return DOLLAR_CURLY; }
-<IND_STRING>\'\' { POP_STATE(); return IND_STRING_CLOSE; }
-<IND_STRING>\'   {
-                   yylval->e = new ExprIndStr("'");
-                   return IND_STR;
-                 }
-<IND_STRING>\n   { PUSH_STATE(IND_STRING_INDENT); return '\n'; }
-<IND_STRING>.    return yytext[0]; /* just in case: shouldn't be reached */
+} // End of <STRING>
+
+<IND_STRING_INDENT>{ /* matches leading spaces of one line of indented strings ('') */
+
+" "*/[^ ]   {
+              POP_STATE();
+              yylval->e = new ExprIndStr(yytext);
+              return IND_STR_INDENT;
+            }
+.           return yytext[0]; /* just in case: shouldn't be reached */
+
+} // End of <IND_STR_INDENT>
+
+<IND_STRING>{ /* matches one line of indented strings ('') */
+
+([^\$\'\n]|\$[^\{\'\n]|\'[^\'\$\n])*\$/[\'\n] |
+([^\$\'\n]|\$[^\{\'\n]|\'[^\'\$\n])+ {
+              yylval->e = new ExprIndStr(yytext);
+              return IND_STR;
+            }
+\'\'\$      {
+              yylval->e = new ExprIndStr("$");
+              return IND_STR;
+            }
+\'\'\'      {
+              yylval->e = new ExprIndStr("''");
+              return IND_STR;
+            }
+\'\'\\/\n   /* Ignore the escape sequence before a newline as it is useless. */
+\'\'\\.     {
+              yylval->e = unescapeStr(data->symbols, yytext + 2);
+              return IND_STR;
+            }
+\$\{        { PUSH_STATE(DEFAULT); return DOLLAR_CURLY; }
+\'\'        { POP_STATE(); return IND_STRING_CLOSE; }
+\'          {
+              yylval->e = new ExprIndStr("'");
+              return IND_STR;
+            }
+\n          { PUSH_STATE(IND_STRING_INDENT); return '\n'; }
+.           return yytext[0]; /* just in case: shouldn't be reached */
+
+} // End of <IND_STR>
 
 
 {PATH}      { yylval->path = strdup(yytext); return PATH; }

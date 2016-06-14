@@ -557,6 +557,7 @@ Expr * EvalState::parse(const char * text,
     data.basePath = basePath;
     data.path = data.symbols.create(path);
 
+
     yylex_init(&scanner);
     YY_BUFFER_STATE handle = yy_scan_string(text, scanner);
     int res = yyparse(scanner, &data);
