@@ -1325,6 +1325,40 @@ void ExprPos::eval(EvalState & state, Env & env, Value & v)
     state.mkPos(v, &pos);
 }
 
+void ExprAntiquot::eval(EvalState & state, Env & env, Value & v)
+{
+    e->eval(state, env, v);
+}
+
+void ExprIndAntiquot::eval(EvalState & state, Env & env, Value & v)
+{
+    PathSet context;
+    Value vTmp;
+
+    e->eval(state, env, vTmp);
+    string s = state.coerceToString(pos, vTmp, context, false, true);
+
+    if (s.empty()) {
+        mkString(v, "", context);
+        return;
+    }
+
+    /* Ensure at least one last '\n' because it has been removed during parsing */
+    if (s.back() != '\n') s.push_back('\n');
+
+    /* Reindent the result string */
+    if (indentLevel > 0) {
+        size_t start_pos = -1;
+        do {
+            ++start_pos;
+            s.insert(start_pos, indentLevel, ' ');
+            start_pos += indentLevel;
+        } while ((start_pos = s.find('\n', start_pos)) < s.size()-1);
+    }
+    debug(format("eval: %1%") % s);
+
+    mkString(v, s, context);
+}
 
 void EvalState::forceValueDeep(Value & v)
 {
