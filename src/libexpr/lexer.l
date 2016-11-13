@@ -92,6 +92,9 @@ PATH        [a-zA-Z0-9\.\_\-\+]*(\/[a-zA-Z0-9\.\_\-\+]+)+
 HPATH       \~(\/[a-zA-Z0-9\.\_\-\+]+)+
 SPATH       \<[a-zA-Z0-9\.\_\-\+]+(\/[a-zA-Z0-9\.\_\-\+]+)*\>
 URI         [a-zA-Z][a-zA-Z0-9\+\-\.]*\:[a-zA-Z0-9\%\/\?\:\@\&\=\+\$\,\-\_\.\!\~\*\']+
+LCOMMENT    \/\*([^(]([^*]|\*+[^/])*)?\*+\/
+ /* PRAGMA      \/\*\(([^)]|\)+[^*]|\)+\*+[^/])*\)+\*\/ */
+PRAGMA      \/\*\(\ *option\ +reindent-antiquotations\ +true\ *\)\*\/ 
 
 
 %%
@@ -202,10 +205,10 @@ or          { return OR_KW; }
 {SPATH}     { yylval->path = strdup(yytext); return SPATH; }
 {URI}       { yylval->uri = strdup(yytext); return URI; }
 
-[ \t\r\n]+    /* eat up whitespace */
-\#[^\r\n]*    /* single-line comments */
-\/\*([^*]|\*[^\/])*\*\/  /* long comments */
-
+[ \t\r\n]+  /* eat up whitespace */
+\#[^\r\n]*  /* single-line comments */
+{LCOMMENT}  /* long comments, not pragma */
+{PRAGMA}    { yylval->pragma = strdup(yytext); return PRAGMA; }
 .           return yytext[0];
 
 <<EOF>> { data->atEnd = true; return 0; }

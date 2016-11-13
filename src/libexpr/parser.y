@@ -34,11 +34,13 @@ namespace nix {
         string error;
         bool atEnd;
         Symbol sLetBody;
+        Options * options;
         ParseData(EvalState & state)
             : state(state)
             , symbols(state.symbols)
             , atEnd(false)
             , sLetBody(symbols.create("<let-body>"))
+            , options(new Options())
             { };
     };
 
@@ -159,7 +161,7 @@ static void pushStringThenExpr(SymbolTable & symbols, vector<Expr *> * es, strin
     if (e) es->push_back(e);
 }
 
-static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<vector<Expr *> *> * es)
+static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<vector<Expr *> *> * es, const Options * options)
 {
     /* Figure out the minimum indentation.  Note that by design
        whitespace-only final lines are not taken into account.  (So
@@ -224,7 +226,7 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<ve
         result = es2->front();
         delete es2;
     } else {
-        result = new ExprConcatStrings(pos, true, es2);
+        result = new ExprConcatStrings(pos, true, es2, options);
     }
     return result;
 }
@@ -262,6 +264,7 @@ void yyerror(YYLTYPE * loc, yyscan_t scanner, ParseData * data, const char * err
   const char * id; // !!! -> Symbol
   char * path;
   char * uri;
+  char * pragma;
   std::vector<nix::AttrName> * attrNames;
   std::vector<nix::Expr *> * string_parts;
   std::vector<std::vector<nix::Expr *> *> * string_lines;
@@ -284,6 +287,7 @@ void yyerror(YYLTYPE * loc, yyscan_t scanner, ParseData * data, const char * err
 %token <nf> FLOAT
 %token <path> PATH HPATH SPATH
 %token <uri> URI
+%token <pragma> PRAGMA
 %token IF THEN ELSE ASSERT WITH LET IN REC INHERIT EQ NEQ AND OR IMPL OR_KW
 %token DOLLAR_CURLY /* == ${ */
 %token IND_STRING_OPEN IND_STRING_CLOSE
@@ -304,7 +308,13 @@ void yyerror(YYLTYPE * loc, yyscan_t scanner, ParseData * data, const char * err
 
 %%
 
-start: expr { data->result = $1; };
+start: pragmas expr { data->result = $2; };
+
+pragmas
+  : PRAGMA { data->options->reindent = true; }
+  |
+  ;
+
 
 expr: expr_function;
 
@@ -387,7 +397,7 @@ expr_simple
   | FLOAT { $$ = new ExprFloat($1); }
   | '"' string_parts '"' { $$ = $2; }
   | IND_STRING_OPEN ind_string_lines IND_STRING_CLOSE {
-      $$ = stripIndentation(CUR_POS, data->symbols, $2);
+      $$ = stripIndentation(CUR_POS, data->symbols, $2, data->options);
   }
   | PATH { $$ = new ExprPath(absPath($1, data->basePath)); }
   | HPATH { $$ = new ExprPath(getEnv("HOME", "") + string{$1 + 1}); }

@@ -50,6 +50,16 @@ extern Pos noPos;
 
 std::ostream & operator << (std::ostream & str, const Pos & pos);
 
+/* Options objet */
+struct Options {
+    Symbol file;
+    bool reindent; // Should we reindent multiline antiquotations ?
+    Options()
+        : file()
+        , reindent(false)
+        {};
+};
+
 
 struct Env;
 struct Value;
@@ -314,8 +324,9 @@ struct ExprConcatStrings : Expr
     Pos pos;
     bool forceString;
     vector<Expr *> * es;
-    ExprConcatStrings(const Pos & pos, bool forceString, vector<Expr *> * es)
-        : pos(pos), forceString(forceString), es(es) { };
+    const Options * options;
+    ExprConcatStrings(const Pos & pos, bool forceString, vector<Expr *> * es, const Options * options = nullptr)
+        : pos(pos), forceString(forceString), es(es), options(options) { };
     COMMON_METHODS
 };
 
