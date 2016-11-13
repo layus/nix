@@ -1331,6 +1331,18 @@ void ExprIndAntiquot::eval(EvalState & state, Env & env, Value & v)
 
     e->eval(state, env, vTmp);
     string s = state.coerceToString(pos, vTmp, context, false, true);
+
+    /* Reindent only if explicitly required */
+    if (!options->reindent) {
+        // Old behaviour
+        // <indent>${ ...}<trail>\n
+        s.insert(0, indentLevel, ' ');
+        s.append(trail);
+        s.push_back('\n');
+        mkString(v, s, context);
+        return;
+    }
+
     if (s.empty()) {
         mkString(v, "", context);
         return;

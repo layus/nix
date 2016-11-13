@@ -131,24 +131,22 @@ static void addFormal(const Pos & pos, Formals * formals, const Formal & formal)
 }
 
 
-static bool isIndAntiquotLine(vector<Expr *> * line)
+static ExprIndAntiquot * getAntiquotLine(const Pos & pos, vector<Expr *> * line, size_t indentLevel, const Options * options)
 {
     size_t len = line->size();
 
-    if (len < 2 || len > 3) return false;
-    if (!dynamic_cast<ExprAntiquot *>(line->at(1))) return false;
+    if (len < 2 || len > 3) return nullptr;
+    if (!dynamic_cast<ExprAntiquot *>(line->at(1))) return nullptr;
 
     if (len == 3) {
-        if (!dynamic_cast<ExprIndStr *>(line->at(2))) return false;
+        if (!dynamic_cast<ExprIndStr *>(line->at(2))) return nullptr;
         string & trailStr = dynamic_cast<ExprIndStr *>(line->at(2))->s;
-        if (trailStr.find_first_not_of(" ") != string::npos) return false;
+        if (trailStr.find_first_not_of(" ") != string::npos) return nullptr;
 
-        // The last empty string is useless for an indented antiquotation.
-        delete line->back();
-        line->pop_back();
+        return new ExprIndAntiquot(pos, line->at(1), indentLevel, trailStr, options);
     }
 
-    return true;
+    return new ExprIndAntiquot(pos, line->at(1), indentLevel, "", options);
 }
 
 static void pushStringThenExpr(SymbolTable & symbols, vector<Expr *> * es, string & s, Expr * e)
@@ -195,8 +193,9 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<ve
 
         /* Single antiquotations on their own lines are ExprIndAntiquot
            and manage their own indentation. */
-        if (settings.enableSmartAntiquotations && isIndAntiquotLine(line)) {
-            pushStringThenExpr(symbols, es2, s2, new ExprIndAntiquot(pos, line->at(1), indent));
+        auto antiquot = getAntiquotLine(pos, line, indent, options);
+        if (antiquot) {
+            pushStringThenExpr(symbols, es2, s2, antiquot);
             delete line;
             continue;
         }
@@ -226,7 +225,7 @@ static Expr * stripIndentation(const Pos & pos, SymbolTable & symbols, vector<ve
         result = es2->front();
         delete es2;
     } else {
-        result = new ExprConcatStrings(pos, true, es2, options);
+        result = new ExprConcatStrings(pos, true, es2);
     }
     return result;
 }
@@ -571,6 +570,7 @@ Expr * EvalState::parse(const char * text,
     ParseData data(*this);
     data.basePath = basePath;
     data.path = data.symbols.create(path);
+    data.options->reindent = settings.enableSmartAntiquotations;
 
     yylex_init(&scanner);
     YY_BUFFER_STATE handle = yy_scan_string(text, scanner);

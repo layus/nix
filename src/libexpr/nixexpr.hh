@@ -324,9 +324,8 @@ struct ExprConcatStrings : Expr
     Pos pos;
     bool forceString;
     vector<Expr *> * es;
-    const Options * options;
-    ExprConcatStrings(const Pos & pos, bool forceString, vector<Expr *> * es, const Options * options = nullptr)
-        : pos(pos), forceString(forceString), es(es), options(options) { };
+    ExprConcatStrings(const Pos & pos, bool forceString, vector<Expr *> * es)
+        : pos(pos), forceString(forceString), es(es) { };
     COMMON_METHODS
 };
 
@@ -342,8 +341,10 @@ struct ExprIndAntiquot : Expr
     Pos pos;
     Expr * e;
     size_t indentLevel;
-    ExprIndAntiquot(const Pos & pos, Expr * e, size_t indentLevel)
-        : pos(pos), e(e), indentLevel(indentLevel) { };
+    string trail;
+    const Options * options;
+    ExprIndAntiquot(const Pos & pos, Expr * e, size_t indentLevel, string trail, const Options * options = nullptr)
+        : pos(pos), e(e), indentLevel(indentLevel), trail(trail), options(options) { };
     COMMON_METHODS
 };
 
