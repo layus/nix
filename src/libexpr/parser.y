@@ -415,9 +415,9 @@ expr_simple
   ;
 
 string_parts
-  : STR
+  : STR { $$ = new ExprString(((ExprString*)$1)->s, CUR_POS); }
   | string_parts_interpolated { $$ = new ExprConcatStrings(CUR_POS, true, $1); }
-  | { $$ = new ExprString(data->symbols.create("")); }
+  | { $$ = new ExprString(data->symbols.create(""), CUR_POS); }
   ;
 
 string_parts_interpolated

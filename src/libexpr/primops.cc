@@ -322,6 +322,17 @@ static void prim_isPath(EvalState & state, const Pos & pos, Value * * args, Valu
     mkBool(v, args[0]->type == tPath);
 }
 
+/* Return position information of the specified value. */
+void prim_unsafeGetPos(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    state.forceValue(*args[0]);
+    if (args[0]->pos == &noPos)
+        mkNull(v);
+    else
+        state.mkPos(v, args[0]->pos);
+}
+
+
 struct CompareValues
 {
     bool operator () (const Value * v1, const Value * v2) const
@@ -2194,6 +2205,7 @@ void EvalState::createBaseEnv()
     addPrimOp("__isFloat", 1, prim_isFloat);
     addPrimOp("__isBool", 1, prim_isBool);
     addPrimOp("__isPath", 1, prim_isPath);
+    addPrimOp("__unsafeGetPos", 1, prim_unsafeGetPos);
     addPrimOp("__genericClosure", 1, prim_genericClosure);
     addPrimOp("abort", 1, prim_abort);
     addPrimOp("__addErrorContext", 2, prim_addErrorContext);

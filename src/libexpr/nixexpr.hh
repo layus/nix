@@ -111,7 +111,8 @@ struct ExprString : Expr
 {
     Symbol s;
     Value v;
-    ExprString(const Symbol & s) : s(s) { mkString(v, s); };
+    Pos pos;
+    ExprString(const Symbol & s, const Pos & pos = noPos) : s(s), pos(pos) { mkString(v, s, &(this->pos)); };
     COMMON_METHODS
     Value * maybeThunk(EvalState & state, Env & env);
 };

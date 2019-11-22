@@ -44,7 +44,7 @@ struct Env
 };
 
 
-Value & mkString(Value & v, const string & s, const PathSet & context = PathSet());
+Value & mkString(Value & v, const string & s, const PathSet & context = PathSet(), const Pos * pos = &noPos);
 
 void copyContext(const Value & v, PathSet & context);
 
@@ -275,7 +275,7 @@ public:
     void mkList(Value & v, size_t length);
     void mkAttrs(Value & v, size_t capacity);
     void mkThunk_(Value & v, Expr * expr);
-    void mkPos(Value & v, Pos * pos);
+    void mkPos(Value & v, const Pos * pos);
 
     void concatLists(Value & v, size_t nrLists, Value * * lists, const Pos & pos);
 

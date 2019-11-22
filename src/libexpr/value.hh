@@ -40,6 +40,7 @@ struct Pos;
 class EvalState;
 class XMLWriter;
 class JSONPlaceholder;
+extern Pos noPos;
 
 
 typedef int64_t NixInt;
@@ -93,6 +94,7 @@ std::ostream & operator << (std::ostream & str, const ExternalValueBase & v);
 
 struct Value
 {
+    const Pos * pos;
     ValueType type;
     union
     {
@@ -227,21 +229,22 @@ static inline void mkPrimOpApp(Value & v, Value & left, Value & right)
 }
 
 
-static inline void mkStringNoCopy(Value & v, const char * s)
+static inline void mkStringNoCopy(Value & v, const char * s, const Pos * pos = &noPos)
 {
     v.type = tString;
     v.string.s = s;
     v.string.context = 0;
+    v.pos = pos;
 }
 
 
-static inline void mkString(Value & v, const Symbol & s)
+static inline void mkString(Value & v, const Symbol & s, const Pos * pos = &noPos)
 {
-    mkStringNoCopy(v, ((const string &) s).c_str());
+    mkStringNoCopy(v, ((const string &) s).c_str(), pos);
 }
 
 
-void mkString(Value & v, const char * s);
+void mkString(Value & v, const char * s, const Pos * pos = &noPos);
 
 
 static inline void mkPathNoCopy(Value & v, const char * s)

@@ -544,15 +544,15 @@ LocalNoInline(void addErrorPrefix(Error & e, const char * s, const string & s2, 
 }
 
 
-void mkString(Value & v, const char * s)
+void mkString(Value & v, const char * s, const Pos * pos)
 {
-    mkStringNoCopy(v, dupString(s));
+    mkStringNoCopy(v, dupString(s), pos);
 }
 
 
-Value & mkString(Value & v, const string & s, const PathSet & context)
+Value & mkString(Value & v, const string & s, const PathSet & context, const Pos * pos)
 {
-    mkString(v, s.c_str());
+    mkString(v, s.c_str(), pos);
     if (!context.empty()) {
         size_t n = 0;
         v.string.context = (const char * *)
@@ -663,7 +663,7 @@ void EvalState::mkThunk_(Value & v, Expr * expr)
 }
 
 
-void EvalState::mkPos(Value & v, Pos * pos)
+void EvalState::mkPos(Value & v, const Pos * pos)
 {
     if (pos && pos->file.set()) {
         mkAttrs(v, 3);
