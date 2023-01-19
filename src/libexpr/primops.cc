@@ -780,7 +780,7 @@ static void prim_addErrorContext(EvalState & state, const PosIdx pos, Value * * 
         auto message = state.coerceToString(pos, *args[0], context,
                 "while evaluating the error message passed to builtins.addErrorContext",
                 false, false).toOwned();
-        e.addTrace(std::nullopt, message);
+        e.addTrace(std::nullopt, message, true);
         throw;
     }
 }
