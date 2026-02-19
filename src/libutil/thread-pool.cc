@@ -9,8 +9,8 @@ ThreadPool::ThreadPool(size_t _maxThreads)
     restoreAffinity(); // FIXME
 
     if (!maxThreads) {
-        maxThreads = std::thread::hardware_concurrency();
-        if (!maxThreads) maxThreads = 1;
+        maxThreads = std::thread::hardware_concurrency() * 8;
+        if (!maxThreads) maxThreads = 8;
     }
 
     debug("starting pool of %d threads", maxThreads - 1);
