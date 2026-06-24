@@ -55,11 +55,18 @@ distributed work adds a second implementation behind this interface.
       both local prototyping (plain PostgreSQL) and the production
       distributed cluster (YugabyteDB) unchanged. (Compiles; runtime
       testing pending a Postgres/YugabyteDB instance.)
-- [ ] `DistributedStore` — a `LocalFSStore` (content on shared storage)
-      whose metadata virtuals are served by a `MetadataBackend`. Additive;
-      does not touch the existing `LocalStore`/SQLite path.
+- [x] `DistributedStore` — a `LocalFSStore` (content on shared storage)
+      whose metadata virtuals are served by a `MetadataBackend`. Registered
+      as `distributed://`; additive (does not touch `LocalStore`/SQLite).
+      Read/query/registration routed to the backend; content from the
+      shared filesystem. (Compiles; runtime testing pending a database.)
+- [ ] `addToStore` on `DistributedStore` — write content to the shared
+      filesystem and register metadata via the backend (currently throws).
 - [ ] Atomic derivation-output registration (fold `registerDerivationOutputs`
       into `registerValidPaths`).
+- [ ] DB-coordinated GC: roots table + GC lease (replaces gc-socket and
+      `/proc`-local liveness); `findRoots`/`collectGarbage` (currently throw).
+- [ ] gRPC transport + pluggable auth (app-keys first).
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
