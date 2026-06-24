@@ -176,6 +176,14 @@ endif
 
 configdata_pub.set('NIX_WITH_AWS_AUTH', s3_aws_auth.enabled().to_int())
 
+# Experimental PostgreSQL/YugabyteDB metadata backend for the distributed store.
+postgres_opt = get_option('postgres')
+libpq = dependency('libpq', required : postgres_opt)
+if libpq.found()
+  deps_private += libpq
+endif
+configdata_pub.set('NIX_WITH_POSTGRES', libpq.found().to_int())
+
 subdir('nix-meson-build-support/generate-header')
 
 generated_headers = []

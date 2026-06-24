@@ -15,6 +15,7 @@
   libseccomp,
   nlohmann_json,
   sqlite,
+  libpq,
   cmake, # for resolving aws-crt-cpp dep
 
   busybox-sandbox-shell ? null,
@@ -38,6 +39,10 @@
   withAWS ?
     # Default is this way because there have been issues building this dependency
     (lib.meta.availableOn stdenv.hostPlatform aws-c-common),
+
+  # Experimental PostgreSQL/YugabyteDB metadata backend for the distributed
+  # store. Off by default; opt in to build it.
+  withPostgres ? false,
 }:
 
 let
@@ -81,7 +86,8 @@ mkMesonLibrary (finalAttrs: {
   ]
   ++ lib.optional stdenv.hostPlatform.isLinux libseccomp
   ++ lib.optional stdenv.hostPlatform.isFreeBSD freebsd.libjail
-  ++ lib.optional withAWS aws-crt-cpp;
+  ++ lib.optional withAWS aws-crt-cpp
+  ++ lib.optional withPostgres libpq;
 
   propagatedBuildInputs = [
     nix-util
@@ -92,6 +98,7 @@ mkMesonLibrary (finalAttrs: {
     (lib.mesonEnable "seccomp-sandboxing" stdenv.hostPlatform.isLinux)
     (lib.mesonBool "embedded-sandbox-shell" embeddedSandboxShell)
     (lib.mesonEnable "s3-aws-auth" withAWS)
+    (lib.mesonEnable "postgres" withPostgres)
   ]
   ++ lib.optionals withSandboxShell [
     (lib.mesonOption "sandbox-shell" sandboxShell)

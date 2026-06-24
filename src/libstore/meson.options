@@ -39,3 +39,10 @@ option(
   type : 'feature',
   description : 'build support for AWS authentication with S3',
 )
+
+option(
+  'postgres',
+  type : 'feature',
+  value : 'disabled',
+  description : 'build the experimental PostgreSQL/YugabyteDB metadata backend for the distributed store',
+)
