@@ -35,24 +35,24 @@ Status guarded(F body)
 struct NixStoreServiceImpl : pb::NixStore::Service
 {
     ref<Store> store;
-    std::string apiKey;
+    std::string token;
 
-    NixStoreServiceImpl(ref<Store> store, std::string apiKey)
+    NixStoreServiceImpl(ref<Store> store, std::string token)
         : store(store)
-        , apiKey(std::move(apiKey))
+        , token(std::move(token))
     {
     }
 
     Status IsValidPath(ServerContext * ctx, const pb::StorePathRequest * req, pb::BoolReply * resp) override
     {
-        if (auto s = checkAuth(*ctx, apiKey); !s.ok())
+        if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() { resp->set_value(store->isValidPath(store->parseStorePath(req->path()))); });
     }
 
     Status QueryValidPaths(ServerContext * ctx, const pb::StorePathsRequest * req, pb::StorePathsReply * resp) override
     {
-        if (auto s = checkAuth(*ctx, apiKey); !s.ok())
+        if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() {
             StorePathSet paths;
@@ -65,7 +65,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
 
     Status QueryPathInfo(ServerContext * ctx, const pb::StorePathRequest * req, pb::PathInfoReply * resp) override
     {
-        if (auto s = checkAuth(*ctx, apiKey); !s.ok())
+        if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() {
             auto path = store->parseStorePath(req->path());
@@ -77,7 +77,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
     Status QueryPathFromHashPart(
         ServerContext * ctx, const pb::HashPartRequest * req, pb::OptionalStorePathReply * resp) override
     {
-        if (auto s = checkAuth(*ctx, apiKey); !s.ok())
+        if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() {
             if (auto p = store->queryPathFromHashPart(req->hash_part()))
@@ -88,7 +88,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
     Status AddToStore(ServerContext * ctx, grpc::ServerReader<pb::AddToStoreChunk> * reader, pb::PathInfoReply * resp)
         override
     {
-        if (auto s = checkAuth(*ctx, apiKey); !s.ok())
+        if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() {
             /* The first message carries the PathInfo; the rest are NAR bytes. */
@@ -108,7 +108,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
     Status NarFromPath(ServerContext * ctx, const pb::StorePathRequest * req, grpc::ServerWriter<pb::NarChunk> * writer)
         override
     {
-        if (auto s = checkAuth(*ctx, apiKey); !s.ok())
+        if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() {
             ChunkSink<grpc::ServerWriter<pb::NarChunk>, pb::NarChunk> sink(*writer, [](std::string_view data) {
@@ -123,9 +123,9 @@ struct NixStoreServiceImpl : pb::NixStore::Service
 
 } // namespace
 
-void runServer(ref<Store> store, const std::string & listenAddr, const std::string & apiKey)
+void runServer(ref<Store> store, const std::string & listenAddr, const std::string & token)
 {
-    NixStoreServiceImpl service(store, apiKey);
+    NixStoreServiceImpl service(store, token);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(listenAddr, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);

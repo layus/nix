@@ -55,27 +55,15 @@ The `Store` virtual interface is already the RPC boundary. `daemon.cc`'s
 Backpressure is handled by gRPC flow control; chunk size ~64 KiB (matching the
 worker protocol's framing chunks).
 
-## Authentication & authorization
+## Authentication
 
-Auth is carried in call metadata / the channel, not in the `.proto`, and
-resolved by a **server interceptor** into `(principal, TrustedFlag, scopes)`.
-This generalises `daemon.cc`'s `authPeer` (SO_PEERCRED), which only works for
-the local unix socket. Pluggable providers, implemented in this order:
+A dumb preshared token. The server is configured with a token; the client
+sends it in the `auth-token` metadata header; the server checks it for
+equality (`grpc-auth.cc`). An empty token disables auth. That's the whole
+scheme — no providers, principals, scopes, or certificate handling.
 
-1. **App / API keys (first)** — an `authorization: ApiKey <key>` header looked
-   up against a credential store (a DB table: key hash → principal, trust,
-   scopes). Simple to issue/rotate/revoke; good for CI and service accounts.
-2. **mTLS** — client certificate at the channel level; the cert subject maps to
-   a principal. Strong machine/node identity.
-3. **OAuth2 / OIDC** — `authorization: Bearer <jwt>`, validated against an
-   issuer (JWKS), claims → principal. Good for human/SSO and short-lived creds.
-
-The per-operation trust checks already in `daemon.cc` (`AddPermRoot`,
-input-addressed `BuildDerivation`, repair, `AddBuildLog`) stay as the
-authorization layer; the interceptor just feeds them a real principal. App keys
-additionally carry **scopes** (e.g. `read`, `build`, `gc`, `admin`) for finer
-control than the current binary trusted flag — enforced in the interceptor /
-service methods.
+Run it over TLS if the token must not travel in the clear (`grpc++` channel
+credentials); the token itself stays a simple shared secret.
 
 ## Build wiring (first implementation step)
 
@@ -99,12 +87,11 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       `QueryValidPaths`, `QueryPathInfo`, `QueryPathFromHashPart`, `AddToStore`,
       `NarFromPath`.
 - [x] `GrpcStore` client (`grpc://host:port`), `grpc-store.cc`.
-- [x] App-key auth provider (`grpc-auth.cc`).
+- [x] Preshared-token auth (`grpc-auth.cc`).
 - [ ] Remaining ops: `BuildPaths`/`BuildDerivation`, `CollectGarbage`/`FindRoots`/
       `AddPermRoot`/`AddTempRoot`, `RegisterDrvOutput`/`QueryRealisation`,
       `AddSignatures`, `QueryReferrers`/`QueryValidDerivers`/`QueryMissing`,
       `addToStoreFromDump`, `getFSAccessor`.
-- [ ] mTLS and OAuth2/OIDC auth providers; scopes enforcement.
 - [ ] Connection pooling/reconnect on the client; map errors ↔ gRPC status
       codes; deadlines/retries for idempotent RPCs.
 

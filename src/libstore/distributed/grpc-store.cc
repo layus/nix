@@ -27,8 +27,8 @@ struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual 
 
     std::string target; // host:port of the gRPC server
 
-    Setting<std::string> apiKey{
-        this, "", "api-key", "App/API key sent as `authorization: ApiKey <key>` for authentication."};
+    Setting<std::string> authToken{
+        this, "", "auth-token", "Preshared token sent in the `auth-token` header for authentication."};
 
     static const std::string name()
     {
@@ -77,11 +77,11 @@ struct GrpcStore : virtual Store
 
     void anchor() override {}
 
-    /* Attach the API key (if any) to a fresh client context. */
+    /* Attach the preshared token (if any) to a fresh client context. */
     void auth(grpc::ClientContext & ctx)
     {
-        if (!config->apiKey.get().empty())
-            ctx.AddMetadata("authorization", "ApiKey " + config->apiKey.get());
+        if (!config->authToken.get().empty())
+            ctx.AddMetadata("auth-token", config->authToken.get());
     }
 
     [[noreturn]] static void fail(const grpc::Status & status)

@@ -25,17 +25,16 @@ namespace nix::grpc_transport {
 namespace pb = nix::distributed::v1;
 
 /**
- * Validate the request's credentials. With a non-empty `apiKey`, the call must
- * carry `authorization: ApiKey <apiKey>` in its metadata. (mTLS and OAuth
- * providers plug in here later; see grpc.md.)
+ * Validate the request's preshared token: with a non-empty `token`, the call
+ * must carry a matching `auth-token` metadata header. Empty `token` = no auth.
  */
-grpc::Status checkAuth(grpc::ServerContext & ctx, const std::string & apiKey);
+grpc::Status checkAuth(grpc::ServerContext & ctx, const std::string & token);
 
 /**
- * Serve `store` over gRPC on `listenAddr` (e.g. "0.0.0.0:5570"), requiring
- * `apiKey` if non-empty. Blocks until the server is shut down.
+ * Serve `store` over gRPC on `listenAddr` (e.g. "0.0.0.0:5570"), requiring the
+ * preshared `token` if non-empty. Blocks until the server is shut down.
  */
-void runServer(ref<Store> store, const std::string & listenAddr, const std::string & apiKey);
+void runServer(ref<Store> store, const std::string & listenAddr, const std::string & token);
 
 /** Fill a `PathInfo` message from a `ValidPathInfo`. */
 inline void toProto(const StoreDirConfig & store, const ValidPathInfo & info, pb::PathInfo & out)

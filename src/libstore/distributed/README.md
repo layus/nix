@@ -104,17 +104,17 @@ See `smoke-test.sh` to reproduce.
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).
-- [x] gRPC transport + app-key auth (core). The `grpc` build feature
+- [x] gRPC transport + preshared-token auth (core). The `grpc` build feature
       (protoc codegen + grpc++/protobuf), a `NixStore` gRPC service serving any
       `Store` (`grpc-server.cc` + the `nix-grpc-store-server` launcher), a
-      `grpc://host:port` client store (`grpc-store.cc`), and app/API-key auth
-      (`grpc-auth.cc`). Unary queries plus client-streaming `addToStore` and
-      server-streaming `narFromPath`. Runtime-validated against a CockroachDB-
-      backed distributed store: query and copy to/from `grpc://` work, and the
-      app-key check accepts valid keys and rejects missing/invalid ones.
+      `grpc://host:port` client store (`grpc-store.cc`), and a dumb preshared
+      token check (`grpc-auth.cc`). Unary queries plus client-streaming
+      `addToStore` and server-streaming `narFromPath`. Runtime-validated against
+      a CockroachDB-backed distributed store: query and copy to/from `grpc://`
+      work, and the token check accepts the right token and rejects others.
 - [ ] Remaining gRPC ops: builds, GC, realisations, `getFSAccessor`,
-      `addToStoreFromDump` (currently throw/no-op over gRPC), plus mTLS and
-      OAuth2/OIDC auth providers and gRPC ↔ status error mapping refinements.
+      `addToStoreFromDump` (currently throw/no-op over gRPC), and gRPC ↔ status
+      error mapping refinements.
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
