@@ -50,11 +50,14 @@ distributed work adds a second implementation behind this interface.
       (no `AUTOINCREMENT`, no triggers; FK / app-transaction integrity).
 - [ ] `SQLiteMetadataBackend` — relocate `LocalStore`'s existing SQL behind
       the seam; route `LocalStore` through it (no behaviour change).
-- [ ] `PostgresMetadataBackend` — Phase 0 prototype validating the schema
-      port and the atomic operations on plain PostgreSQL.
-- [ ] Distributed backend on the chosen substrate (CockroachDB/Yugabyte
-      recommended for the symmetric topology; rqlite/dqlite for minimal
-      divergence; FoundationDB for a hand-built KV layer).
+- [ ] `PostgresMetadataBackend` (libpq) — implements the seam against the
+      PostgreSQL wire protocol. **Chosen substrate: YugabyteDB**, whose
+      YSQL layer is Postgres-wire-compatible, so this one backend serves
+      both local prototyping (plain PostgreSQL) and the production
+      distributed cluster (YugabyteDB) unchanged.
+- [ ] `DistributedStore` — a `LocalFSStore` (content on shared storage)
+      whose metadata virtuals are served by a `MetadataBackend`. Additive;
+      does not touch the existing `LocalStore`/SQLite path.
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
       and `/proc`-local liveness.
 - [ ] gRPC transport (`.proto`, server reusing the `Store` dispatch,
