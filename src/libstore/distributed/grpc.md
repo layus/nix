@@ -1,0 +1,104 @@
+# gRPC transport for the distributed store (DRAFT)
+
+This is the design for the cluster's network transport: a gRPC API
+(`nix-store.proto`) with modern authentication, replacing the
+worker-protocol-over-SSH (`ssh-ng`) for remote/cluster traffic. The local
+unix-socket worker protocol is unchanged. Status: **draft** — the `.proto` and
+this design are in place; the build wiring, codegen, server, and client are not
+yet implemented.
+
+## Why gRPC here
+
+- Remote clients (dev machines, CI) use the cluster as a remote store. A gRPC
+  endpoint behind an L7 load balancer (which understands HTTP/2 and per-RPC
+  routing) gives transparent load-balancing, health checks, and auth
+  termination — a better fit than L4-fronting raw SSH.
+- gRPC brings deadlines, retries, streaming, and mature client libraries.
+- It decouples client identity from SSH key distribution: app keys / OAuth /
+  mTLS instead of `authorized_keys`.
+
+Clients remain **cluster-unaware**: one stable endpoint URL + a credential.
+
+## The seam (why this is not a rewrite)
+
+The `Store` virtual interface is already the RPC boundary. `daemon.cc`'s
+`performOp` reads a worker-protocol op and dispatches to a `Store` method;
+`RemoteStore` is the mirror-image client. Everything flows through abstract
+`Source`/`Sink`. So:
+
+- **Server**: a gRPC service implementation is an *alternative dispatcher* that
+  calls the **same `Store` methods** `performOp` calls. Wrap the gRPC
+  reader/writer in `Source`/`Sink` adapters (`GrpcSource`/`GrpcSink`) and the
+  existing NAR streaming code is reused unchanged.
+- **Client**: a `GrpcStore : RemoteStore`-shaped subclass marshals each `Store`
+  method over a gRPC channel, reusing `RemoteStore`'s connection-pool pattern.
+
+## Streaming
+
+- `AddToStore` / `AddMultipleToStore` → **client-streaming**: first message is
+  the `PathInfo`, subsequent messages are NAR byte chunks. The server feeds the
+  chunk stream into a `GrpcSource` and calls `addToStore`.
+- `NarFromPath` → **server-streaming**: `narFromPath` writes into a `GrpcSink`
+  that emits `NarChunk`s.
+- Build log/progress (today's `STDERR_NEXT` / `STDERR_START_ACTIVITY` … on the
+  worker protocol) → the server-streamed `BuildEvent` channel of `BuildPaths` /
+  `BuildDerivation`, terminated by a `BuildResult`. This replaces inlining log
+  control messages into the data stream.
+
+Backpressure is handled by gRPC flow control; chunk size ~64 KiB (matching the
+worker protocol's framing chunks).
+
+## Authentication & authorization
+
+Auth is carried in call metadata / the channel, not in the `.proto`, and
+resolved by a **server interceptor** into `(principal, TrustedFlag, scopes)`.
+This generalises `daemon.cc`'s `authPeer` (SO_PEERCRED), which only works for
+the local unix socket. Pluggable providers, implemented in this order:
+
+1. **App / API keys (first)** — an `authorization: ApiKey <key>` header looked
+   up against a credential store (a DB table: key hash → principal, trust,
+   scopes). Simple to issue/rotate/revoke; good for CI and service accounts.
+2. **mTLS** — client certificate at the channel level; the cert subject maps to
+   a principal. Strong machine/node identity.
+3. **OAuth2 / OIDC** — `authorization: Bearer <jwt>`, validated against an
+   issuer (JWKS), claims → principal. Good for human/SSO and short-lived creds.
+
+The per-operation trust checks already in `daemon.cc` (`AddPermRoot`,
+input-addressed `BuildDerivation`, repair, `AddBuildLog`) stay as the
+authorization layer; the interceptor just feeds them a real principal. App keys
+additionally carry **scopes** (e.g. `read`, `build`, `gc`, `admin`) for finer
+control than the current binary trusted flag — enforced in the interceptor /
+service methods.
+
+## Build wiring (first implementation step)
+
+Add an optional `grpc` meson feature (mirroring the `postgres` feature):
+
+- depend on `grpc++` and `protobuf` (and `protobuf-compiler` / `grpc_cpp_plugin`
+  as native build tools);
+- a meson custom target runs `protoc` on `nix-store.proto` to generate
+  `nix-store.pb.{h,cc}` and `nix-store.grpc.pb.{h,cc}`;
+- compile the generated sources + the server/client behind `NIX_WITH_GRPC`,
+  exactly as the postgres backend is behind `NIX_WITH_POSTGRES`;
+- add `grpc++` / `protobuf` to `package.nix` under a `withGrpc` flag.
+
+## Implementation checklist
+
+- [ ] `grpc` meson feature + `protoc` codegen target + `package.nix` wiring.
+- [ ] `GrpcSource` / `GrpcSink` (`Source`/`Sink` over gRPC reader/writer).
+- [ ] gRPC server: service impl dispatching to `Store` methods (reuse the
+      `performOp` logic), mounted by a node alongside its unix-socket daemon.
+- [ ] `GrpcStore` client (`distributed+grpc://` or a `grpc://` store URI),
+      mirroring `RemoteStore`, with connection pooling and reconnect.
+- [ ] Auth interceptor with the app-key provider (then mTLS, then OIDC).
+- [ ] Map worker-protocol errors ↔ gRPC status codes; deadlines/retries for
+      idempotent RPCs (queries, content-addressed `AddToStore`).
+
+## How it composes with the rest
+
+A node runs: its local unix-socket daemon (unchanged), the gRPC server (this
+doc), and a `DistributedStore` (shared FS + Postgres/YugabyteDB metadata, with
+coordinated GC). Remote clients hit the gRPC endpoint behind an L7 LB; the gRPC
+server services them via the `DistributedStore`, whose metadata writes are made
+safe across nodes by the database. See the top-level design plan for the full
+cluster picture (topology, failover, client connectivity).

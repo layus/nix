@@ -1,0 +1,131 @@
+// gRPC service for the distributed Nix store (DRAFT).
+//
+// This is the network transport for the cluster: a gRPC API that replaces the
+// worker-protocol-over-SSH (`ssh-ng`) for remote/cluster traffic. The local
+// unix-socket worker protocol is unchanged.
+//
+// The service surface is the `Store` virtual interface (the same boundary the
+// worker protocol marshals): the gRPC server is an alternative dispatcher that
+// calls the same `Store` methods `daemon.cc`'s `performOp` does, and a
+// `GrpcStore` client mirrors `RemoteStore`. Bulk NAR transfer maps to gRPC
+// streaming; logs/build progress (today's STDERR_* multiplex) map to a
+// server-streamed event channel.
+//
+// Authentication is NOT modelled here: it is carried in call metadata (an
+// `authorization` header bearing an app/API key, OAuth2 bearer token, or — at
+// the channel level — an mTLS client certificate) and resolved by a server
+// interceptor into a principal + trust decision. See grpc.md.
+
+syntax = "proto3";
+
+package nix.distributed.v1;
+
+service NixStore {
+  // --- Queries (unary) ---
+  rpc IsValidPath(StorePathRequest) returns (BoolReply);
+  rpc QueryValidPaths(StorePathsRequest) returns (StorePathsReply);
+  rpc QueryPathInfo(StorePathRequest) returns (PathInfoReply); // unset info => not valid
+  rpc QueryPathFromHashPart(HashPartRequest) returns (OptionalStorePathReply);
+  rpc QueryReferrers(StorePathRequest) returns (StorePathsReply);
+  rpc QueryValidDerivers(StorePathRequest) returns (StorePathsReply);
+  rpc QueryMissing(StorePathsRequest) returns (QueryMissingReply);
+
+  // --- Bulk content transfer (streamed) ---
+  // First message carries the ValidPathInfo; subsequent messages carry NAR bytes.
+  rpc AddToStore(stream AddToStoreChunk) returns (PathInfoReply);
+  // Server streams NAR bytes for the path.
+  rpc NarFromPath(StorePathRequest) returns (stream NarChunk);
+
+  // --- Realisations / signatures ---
+  rpc RegisterDrvOutput(Realisation) returns (Empty);
+  rpc QueryRealisation(DrvOutputRequest) returns (OptionalRealisationReply);
+  rpc AddSignatures(AddSignaturesRequest) returns (Empty);
+
+  // --- Builds: server-streams live log/progress events, then a final result ---
+  rpc BuildPaths(BuildPathsRequest) returns (stream BuildEvent);
+  rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildEvent);
+
+  // --- GC / roots ---
+  rpc AddTempRoot(StorePathRequest) returns (Empty);
+  rpc AddPermRoot(AddPermRootRequest) returns (StringReply);
+  rpc FindRoots(Empty) returns (RootsReply);
+  rpc CollectGarbage(GCRequest) returns (GCReply);
+}
+
+// Store paths are their full textual form, e.g. "/nix/store/<hash>-<name>".
+message StorePathRequest  { string path = 1; }
+message StorePathsRequest { repeated string paths = 1; bool substitute = 2; }
+message HashPartRequest   { string hash_part = 1; }
+message DrvOutputRequest  { string drv_output = 1; } // "<drvhash>!<output>"
+
+message Empty {}
+message BoolReply             { bool value = 1; }
+message StringReply           { string value = 1; }
+message StorePathsReply       { repeated string paths = 1; }
+message OptionalStorePathReply { optional string path = 1; }
+
+// Mirrors ValidPathInfo.
+message PathInfo {
+  string path              = 1;
+  string nar_hash          = 2; // SRI, e.g. "sha256-..."
+  uint64 nar_size          = 3;
+  repeated string references = 4;
+  optional string deriver  = 5;
+  repeated string sigs     = 6;
+  optional string ca       = 7; // content address, if content-addressed
+  bool ultimate            = 8;
+  int64 registration_time  = 9;
+}
+message PathInfoReply { optional PathInfo info = 1; }
+
+message AddToStoreChunk {
+  oneof kind {
+    PathInfo info = 1; // exactly one, first
+    bytes nar     = 2; // zero or more, in order
+  }
+}
+message NarChunk { bytes nar = 1; }
+
+message Realisation {
+  string drv_output = 1; // "<drvhash>!<output>"
+  string out_path   = 2;
+  repeated string signatures = 3;
+}
+message OptionalRealisationReply { optional Realisation realisation = 1; }
+message AddSignaturesRequest { string path = 1; repeated string sigs = 2; }
+
+message QueryMissingReply {
+  repeated string will_build     = 1;
+  repeated string will_substitute = 2;
+  repeated string unknown        = 3;
+  uint64 download_size           = 4;
+  uint64 nar_size                = 5;
+}
+
+message BuildPathsRequest      { repeated string drvd_paths = 1; BuildMode mode = 2; }
+message BuildDerivationRequest { string drv_path = 1; bytes drv = 2; BuildMode mode = 3; }
+enum BuildMode { NORMAL = 0; REPAIR = 1; CHECK = 2; }
+
+// One streamed build event: a log line, an activity/progress update, or the
+// terminal result. Replaces the worker protocol's STDERR_* multiplex.
+message BuildEvent {
+  oneof event {
+    string log_line      = 1;
+    ActivityUpdate activity = 2;
+    BuildResult result   = 3; // terminal
+  }
+}
+message ActivityUpdate { uint64 id = 1; string text = 2; uint64 done = 3; uint64 expected = 4; }
+message BuildResult { bool success = 1; string error = 2; }
+
+message AddPermRootRequest { string store_path = 1; string gc_root = 2; }
+message RootsReply { map<string, StorePathsReply> roots = 1; } // path -> rooting links
+
+message GCRequest {
+  enum Action { RETURN_LIVE = 0; RETURN_DEAD = 1; DELETE_DEAD = 2; DELETE_SPECIFIC = 3; }
+  Action action            = 1;
+  bool ignore_liveness     = 2;
+  repeated string paths_to_delete = 3; // for DELETE_SPECIFIC
+  uint64 max_freed         = 4;
+}
+message GCReply { repeated string paths = 1; uint64 bytes_freed = 2; }
