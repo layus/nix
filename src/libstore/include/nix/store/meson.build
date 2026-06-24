@@ -59,6 +59,7 @@ headers = [ config_pub_h ] + files(
   'log-store.hh',
   'machines.hh',
   'make-content-addressed.hh',
+  'metadata-backend.hh',
   'names.hh',
   'nar-info-disk-cache.hh',
   'nar-info.hh',

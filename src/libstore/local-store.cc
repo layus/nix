@@ -1,4 +1,5 @@
 #include "nix/store/local-store.hh"
+#include "nix/store/metadata-backend.hh"
 #include "nix/store/globals.hh"
 #include "nix/util/git.hh"
 #include "nix/util/archive.hh"
