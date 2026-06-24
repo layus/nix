@@ -46,3 +46,10 @@ option(
   value : 'disabled',
   description : 'build the experimental PostgreSQL/YugabyteDB metadata backend for the distributed store',
 )
+
+option(
+  'grpc',
+  type : 'feature',
+  value : 'disabled',
+  description : 'build the experimental gRPC network transport for the distributed store',
+)

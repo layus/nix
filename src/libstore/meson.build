@@ -184,6 +184,17 @@ if libpq.found()
 endif
 configdata_pub.set('NIX_WITH_POSTGRES', libpq.found().to_int())
 
+# Experimental gRPC network transport for the distributed store. The codegen
+# and its library are declared later (after all add_project_arguments), since
+# meson forbids declaring build targets before project arguments.
+grpc_opt = get_option('grpc')
+protobuf_dep = dependency('protobuf', required : grpc_opt)
+grpcpp_dep = dependency('grpc++', required : grpc_opt)
+protoc = find_program('protoc', required : grpc_opt)
+grpc_cpp_plugin = find_program('grpc_cpp_plugin', required : grpc_opt)
+grpc_enabled = protobuf_dep.found() and grpcpp_dep.found() and protoc.found() and grpc_cpp_plugin.found()
+configdata_pub.set('NIX_WITH_GRPC', grpc_enabled.to_int())
+
 subdir('nix-meson-build-support/generate-header')
 
 generated_headers = []
@@ -288,6 +299,62 @@ config_priv_h = configure_file(
 
 subdir('nix-meson-build-support/common')
 
+# gRPC codegen + generated-code library (declared here, after all
+# add_project_arguments, as meson requires for build targets).
+if grpc_enabled
+  proto_file = files('distributed/nix-store.proto')
+  # Message classes (*.pb.{h,cc}).
+  pb = custom_target(
+    'nix-store-pb',
+    input : proto_file,
+    output : ['nix-store.pb.cc', 'nix-store.pb.h'],
+    command : [protoc, '--proto_path=@CURRENT_SOURCE_DIR@/distributed', '--cpp_out=@OUTDIR@', '@INPUT@'],
+  )
+  # Service stubs (*.grpc.pb.{h,cc}).
+  grpc_pb = custom_target(
+    'nix-store-grpc-pb',
+    input : proto_file,
+    output : ['nix-store.grpc.pb.cc', 'nix-store.grpc.pb.h'],
+    command : [
+      protoc,
+      '--proto_path=@CURRENT_SOURCE_DIR@/distributed',
+      '--grpc_out=@OUTDIR@',
+      '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
+      '@INPUT@',
+    ],
+  )
+  # Compile the generated code with warnings-as-errors disabled: it is
+  # machine-generated and trips Nix's strict -Werror flags (e.g. unhandled
+  # oneof *_NOT_SET cases under -Werror=switch-enum).
+  grpc_proto_lib = static_library(
+    'nix-store-proto',
+    [pb, grpc_pb],
+    dependencies : [protobuf_dep, grpcpp_dep],
+    # Undo each specific -Werror=… the project sets (a blanket -Wno-error does
+    # not override -Werror=<name>), plus quiet the generated noise.
+    cpp_args : [
+      '-Wno-error=switch-enum',
+      '-Wno-error=switch',
+      '-Wno-error=sign-compare',
+      '-Wno-error=undef',
+      '-Wno-error=unused-result',
+      '-Wno-error=suggest-override',
+      '-Wno-error=non-virtual-dtor',
+      '-Wno-error=return-type',
+      '-Wno-unused-parameter',
+    ],
+    pic : true,
+  )
+  # Generated headers land in this target's build dir, already on the include
+  # path via `-Isrc/libstore`. Listing the header outputs as `sources` makes
+  # dependents wait for codegen.
+  deps_other += declare_dependency(
+    link_with : grpc_proto_lib,
+    sources : [pb[1], grpc_pb[1]],
+    dependencies : [protobuf_dep, grpcpp_dep],
+  )
+endif
+
 sources = files(
   'binary-cache-store.cc',
   'build-result.cc',
@@ -379,6 +446,16 @@ if libpq.found()
   sources += files(
     'distributed/postgres-metadata-backend.cc',
     'distributed/distributed-store.cc',
+  )
+endif
+
+# Experimental gRPC transport: the hand-written server, client, and auth (the
+# protoc-generated sources are built separately in `grpc_proto_lib`).
+if grpc_enabled
+  sources += files(
+    'distributed/grpc-store.cc',
+    'distributed/grpc-server.cc',
+    'distributed/grpc-auth.cc',
   )
 endif
 
