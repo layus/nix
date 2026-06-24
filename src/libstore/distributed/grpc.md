@@ -3,9 +3,16 @@
 This is the design for the cluster's network transport: a gRPC API
 (`nix-store.proto`) with modern authentication, replacing the
 worker-protocol-over-SSH (`ssh-ng`) for remote/cluster traffic. The local
-unix-socket worker protocol is unchanged. Status: **draft** — the `.proto` and
-this design are in place; the build wiring, codegen, server, and client are not
-yet implemented.
+unix-socket worker protocol is unchanged.
+
+Status: **core implemented and runtime-validated.** The `grpc` build feature,
+protoc codegen, the server (`grpc-server.cc` + the `nix-grpc-store-server`
+launcher), the `grpc://` client store (`grpc-store.cc`), and app-key auth
+(`grpc-auth.cc`) exist and pass an end-to-end test (query + copy to/from a
+`grpc://` store backed by a CockroachDB distributed store). What remains:
+bridging the rest of the operations (builds, GC, realisations, `getFSAccessor`,
+`addToStoreFromDump`) and the additional auth providers (mTLS, OIDC) — see the
+checklist at the end.
 
 ## Why gRPC here
 
@@ -84,15 +91,22 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
 
 ## Implementation checklist
 
-- [ ] `grpc` meson feature + `protoc` codegen target + `package.nix` wiring.
-- [ ] `GrpcSource` / `GrpcSink` (`Source`/`Sink` over gRPC reader/writer).
-- [ ] gRPC server: service impl dispatching to `Store` methods (reuse the
-      `performOp` logic), mounted by a node alongside its unix-socket daemon.
-- [ ] `GrpcStore` client (`distributed+grpc://` or a `grpc://` store URI),
-      mirroring `RemoteStore`, with connection pooling and reconnect.
-- [ ] Auth interceptor with the app-key provider (then mTLS, then OIDC).
-- [ ] Map worker-protocol errors ↔ gRPC status codes; deadlines/retries for
-      idempotent RPCs (queries, content-addressed `AddToStore`).
+- [x] `grpc` meson feature + `protoc` codegen target + `package.nix` wiring.
+- [x] `ChunkSink` / `ChunkSource` (`Sink`/`Source` over gRPC streams), in
+      `grpc-common.hh`.
+- [x] gRPC server: service impl serving a `Store` (`grpc-server.cc`), with the
+      `nix-grpc-store-server` launcher. Core ops: `IsValidPath`,
+      `QueryValidPaths`, `QueryPathInfo`, `QueryPathFromHashPart`, `AddToStore`,
+      `NarFromPath`.
+- [x] `GrpcStore` client (`grpc://host:port`), `grpc-store.cc`.
+- [x] App-key auth provider (`grpc-auth.cc`).
+- [ ] Remaining ops: `BuildPaths`/`BuildDerivation`, `CollectGarbage`/`FindRoots`/
+      `AddPermRoot`/`AddTempRoot`, `RegisterDrvOutput`/`QueryRealisation`,
+      `AddSignatures`, `QueryReferrers`/`QueryValidDerivers`/`QueryMissing`,
+      `addToStoreFromDump`, `getFSAccessor`.
+- [ ] mTLS and OAuth2/OIDC auth providers; scopes enforcement.
+- [ ] Connection pooling/reconnect on the client; map errors ↔ gRPC status
+      codes; deadlines/retries for idempotent RPCs.
 
 ## How it composes with the rest
 
