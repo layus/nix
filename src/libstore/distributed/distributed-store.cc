@@ -5,8 +5,14 @@
 #  include "nix/store/distributed-store.hh"
 #  include "nix/store/postgres-metadata-backend.hh"
 #  include "nix/store/store-registration.hh"
+#  include "nix/store/pathlocks.hh"
+#  include "nix/store/posix-fs-canonicalise.hh"
 #  include "nix/util/callback.hh"
 #  include "nix/util/error.hh"
+#  include "nix/util/archive.hh"
+#  include "nix/util/hash.hh"
+#  include "nix/util/serialise.hh"
+#  include "nix/util/file-system.hh"
 
 namespace nix {
 
@@ -141,9 +147,57 @@ void DistributedStore::queryRealisationUncached(
    storage that the distributed store does not yet provide. Builds are
    expected to run locally and their results be copied/registered in. */
 
-void DistributedStore::addToStore(const ValidPathInfo &, Source &, RepairFlag, CheckSigsFlag)
+void DistributedStore::addToStore(
+    const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
 {
-    throw Error("'addToStore' is not yet supported on the distributed store");
+    if (checkSigs && pathInfoIsUntrusted(info))
+        throw Error(
+            "cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
+
+    if (!repair && isValidPath(info.path))
+        return;
+
+    /* Lock the output path against concurrent writers on this node. (Content
+       is content-addressed, so concurrent writers on other nodes converge.) */
+    auto realPath = toRealPath(info.path);
+    PathLocks outputLock;
+    outputLock.lockPaths({realPath.string()});
+
+    /* It may have become valid in the meantime. */
+    if (!repair && isValidPathUncached(info.path))
+        return;
+
+    deletePath(realPath);
+
+    /* Restore the NAR while computing its hash, then verify it matches. */
+    HashSink hashSink(HashAlgorithm::SHA256);
+    TeeSource wrapperSource{source, hashSink};
+    restorePath(realPath, wrapperSource);
+    auto hashResult = hashSink.finish();
+
+    if (hashResult.hash != info.narHash)
+        throw Error(
+            "hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+            printStorePath(info.path),
+            info.narHash.to_string(HashFormat::SRI, true),
+            hashResult.hash.to_string(HashFormat::SRI, true));
+
+    if (hashResult.numBytesDigested != info.narSize)
+        throw Error(
+            "size mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+            printStorePath(info.path),
+            info.narSize,
+            hashResult.numBytesDigested);
+
+    /* TODO: for content-addressed paths (info.ca), re-verify the content
+       address against the restored content, as LocalStore does. */
+
+    static const StringSet emptyAcls;
+    canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(emptyAcls)});
+
+    backend->registerValidPaths(ValidPathInfos{{info.path, info}});
+
+    outputLock.setDeletion(true);
 }
 
 StorePath DistributedStore::addToStoreFromDump(
