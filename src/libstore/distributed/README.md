@@ -43,6 +43,27 @@ documents the atomic boundaries every backend must preserve. Today only
 SQLite (inside `LocalStore`) implements the equivalent operations; the
 distributed work adds a second implementation behind this interface.
 
+## Validation
+
+The store has been exercised end-to-end against a **live database** — not
+just compiled. Using a `nix` built with the `postgres` feature, the
+`smoke-test.sh` round-trip (store open + schema init → `nix copy` →
+`path-info` → `store verify` → closure copy with references) passed against
+both **PostgreSQL 16** and **CockroachDB v23.1** (the YugabyteDB-class
+target). Validated paths:
+
+- store registration, store-URI/config parsing, libpq connection, idempotent
+  `initSchema`;
+- `addToStore`: content written to the shared dir, canonicalised, NAR hash and
+  size verified, metadata registered;
+- `queryPathInfo` field round-trip (NAR hash, size, content address, references);
+- reference graph: a closure copied in topological order, `Refs` rows recorded,
+  references read back;
+- NAR integrity via `nix store verify`;
+- the FK `RESTRICT` integrity guard (deleting a still-referenced path fails).
+
+See `smoke-test.sh` to reproduce.
+
 ## Status / roadmap
 
 - [x] `MetadataBackend` interface (the seam).
