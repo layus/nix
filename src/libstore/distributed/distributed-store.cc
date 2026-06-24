@@ -13,6 +13,8 @@
 #  include "nix/util/hash.hh"
 #  include "nix/util/serialise.hh"
 #  include "nix/util/file-system.hh"
+#  include "nix/util/source-accessor.hh"
+#  include "nix/util/file-content-address.hh"
 
 namespace nix {
 
@@ -201,15 +203,72 @@ void DistributedStore::addToStore(
 }
 
 StorePath DistributedStore::addToStoreFromDump(
-    Source &,
-    std::string_view,
-    FileSerialisationMethod,
-    ContentAddressMethod,
-    HashAlgorithm,
-    const StorePathSet &,
-    RepairFlag)
+    Source & source0,
+    std::string_view name,
+    FileSerialisationMethod dumpMethod,
+    ContentAddressMethod hashMethod,
+    HashAlgorithm hashAlgo,
+    const StorePathSet & references,
+    RepairFlag repair)
 {
-    throw Error("'addToStoreFromDump' is not yet supported on the distributed store");
+    /* Hash the dump as it streams in (for computing the store path). */
+    HashSink hashSink{hashAlgo};
+    TeeSource source{source0, hashSink};
+
+    /* Restore the dump into a temporary directory in the store. (Unlike
+       LocalStore we always go via a temp path, skipping the in-memory
+       fast path, for simplicity.) */
+    auto tempDir = createTempDir(config->realStoreDir.get(), "nix-distributed-add");
+    AutoDelete delTempDir(tempDir, true);
+    auto tempPath = tempDir / "x";
+    restorePath(tempPath, source, dumpMethod);
+
+    auto [dumpHash, size] = hashSink.finish();
+
+    bool methodsMatch = static_cast<FileIngestionMethod>(dumpMethod) == hashMethod.getFileIngestionMethod();
+
+    auto desc = ContentAddressWithReferences::fromParts(
+        hashMethod,
+        methodsMatch
+            ? dumpHash
+            : hashPath(makeFSSourceAccessor(tempPath), hashMethod.getFileIngestionMethod(), hashAlgo).first,
+        {
+            .others = references,
+            .self = false,
+        });
+
+    auto dstPath = makeFixedOutputPathFromCA(name, desc);
+
+    if (!repair && isValidPath(dstPath))
+        return dstPath;
+
+    auto realPath = toRealPath(dstPath);
+    PathLocks outputLock({realPath.string()});
+
+    if (!repair && isValidPathUncached(dstPath))
+        return dstPath;
+
+    deletePath(realPath);
+    moveFile(tempPath, realPath);
+
+    /* Compute the NAR hash (the same as the dump hash only in recursive
+       SHA-256 mode). */
+    HashResult narHash = {dumpHash, size};
+    if (dumpMethod != FileSerialisationMethod::NixArchive || hashAlgo != HashAlgorithm::SHA256) {
+        HashSink narSink{HashAlgorithm::SHA256};
+        dumpPath(realPath, narSink);
+        narHash = narSink.finish();
+    }
+
+    static const StringSet emptyAcls;
+    canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(emptyAcls)});
+
+    auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), narHash.hash);
+    info.narSize = narHash.numBytesDigested;
+    backend->registerValidPaths(ValidPathInfos{{info.path, info}});
+
+    outputLock.setDeletion(true);
+    return dstPath;
 }
 
 Roots DistributedStore::findRoots(bool)
