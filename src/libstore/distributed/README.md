@@ -48,16 +48,20 @@ distributed work adds a second implementation behind this interface.
 - [x] `MetadataBackend` interface (the seam).
 - [x] `schema.sql` — portable, `StorePath`-keyed port of the SQLite schema
       (no `AUTOINCREMENT`, no triggers; FK / app-transaction integrity).
-- [ ] `SQLiteMetadataBackend` — relocate `LocalStore`'s existing SQL behind
-      the seam; route `LocalStore` through it (no behaviour change).
-- [ ] `PostgresMetadataBackend` (libpq) — implements the seam against the
+- [x] Optional `postgres` build feature (libpq) wired into meson/package.nix.
+- [x] `PostgresMetadataBackend` (libpq) — implements the seam against the
       PostgreSQL wire protocol. **Chosen substrate: YugabyteDB**, whose
       YSQL layer is Postgres-wire-compatible, so this one backend serves
       both local prototyping (plain PostgreSQL) and the production
-      distributed cluster (YugabyteDB) unchanged.
+      distributed cluster (YugabyteDB) unchanged. (Compiles; runtime
+      testing pending a Postgres/YugabyteDB instance.)
 - [ ] `DistributedStore` — a `LocalFSStore` (content on shared storage)
       whose metadata virtuals are served by a `MetadataBackend`. Additive;
       does not touch the existing `LocalStore`/SQLite path.
+- [ ] Atomic derivation-output registration (fold `registerDerivationOutputs`
+      into `registerValidPaths`).
+- [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
+      the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
       and `/proc`-local liveness.
 - [ ] gRPC transport (`.proto`, server reusing the `Store` dispatch,
