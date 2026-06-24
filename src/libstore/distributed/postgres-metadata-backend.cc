@@ -187,6 +187,16 @@ void PostgresMetadataBackend::initSchema()
             signatures text,
             primary key (drvPath, outputName)
         );
+        create table if not exists GCRoots (
+            link text primary key,
+            path text not null
+        );
+        create index if not exists IndexGCRootsPath on GCRoots(path);
+        create table if not exists GCLease (
+            id      integer primary key,
+            holder  text,
+            expires bigint not null
+        );
     )sql";
     exec(schema);
 }
@@ -475,6 +485,73 @@ void PostgresMetadataBackend::registerDrvOutput(const Realisation & info)
             {drvPath, info.id.outputName, store.printStorePath(info.outPath), serialiseSigs(info.signatures)}));
     }
     txn.commit();
+}
+
+/* ------------------------------------------------------------------ *
+ * Garbage collection
+ * ------------------------------------------------------------------ */
+
+void PostgresMetadataBackend::addRoot(const std::string & link, const StorePath & path)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result(execParams(
+        "insert into GCRoots (link, path) values ($1, $2) on conflict (link) do update set path = excluded.path",
+        {link, store.printStorePath(path)}));
+}
+
+std::map<StorePath, std::set<std::string>> PostgresMetadataBackend::queryRoots()
+{
+    auto lock = std::scoped_lock(mutex);
+    Result res(execParams("select link, path from GCRoots", {}));
+    std::map<StorePath, std::set<std::string>> roots;
+    for (int i = 0; i < res.ntuples(); ++i)
+        roots[store.parseStorePath(res.get(i, 1))].insert(res.get(i, 0));
+    return roots;
+}
+
+void PostgresMetadataBackend::removeValidPaths(const StorePathSet & paths)
+{
+    auto lock = std::scoped_lock(mutex);
+    Txn txn(*this);
+    /* Remove every reference edge touching the set first, so the subsequent
+       ValidPaths deletes cannot trip the `on delete restrict` foreign key.
+       This is sound because the set is closed under referrers. */
+    for (auto & p : paths) {
+        auto ps = store.printStorePath(p);
+        Result(execParams("delete from Refs where referrer = $1 or reference = $1", {ps}));
+    }
+    for (auto & p : paths)
+        Result(execParams("delete from ValidPaths where path = $1", {store.printStorePath(p)}));
+    txn.commit();
+}
+
+bool PostgresMetadataBackend::acquireGCLease(const std::string & holder, uint64_t ttlSeconds)
+{
+    auto lock = std::scoped_lock(mutex);
+    Txn txn(*this);
+    int64_t now = (int64_t) time(nullptr);
+    int64_t expires = now + (int64_t) ttlSeconds;
+
+    /* Ensure the single lease row exists, then lock it. */
+    Result(execParams("insert into GCLease (id, holder, expires) values (1, NULL, 0) on conflict (id) do nothing", {}));
+    Result cur(execParams("select holder, expires from GCLease where id = 1 for update", {}));
+
+    bool heldByOther = cur.ntuples() > 0 && !cur.isNull(0, 0) && std::stoll(cur.get(0, 1)) > now
+                       && cur.get(0, 0) != holder;
+    if (heldByOther) {
+        txn.commit();
+        return false;
+    }
+
+    Result(execParams("update GCLease set holder = $1, expires = $2 where id = 1", {holder, std::to_string(expires)}));
+    txn.commit();
+    return true;
+}
+
+void PostgresMetadataBackend::releaseGCLease(const std::string & holder)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result(execParams("update GCLease set holder = NULL, expires = 0 where holder = $1", {holder}));
 }
 
 } // namespace nix

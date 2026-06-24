@@ -77,3 +77,24 @@ create table if not exists Realisations (
 );
 
 create index if not exists IndexRealisations on Realisations(drvPath, outputName);
+
+-- Garbage-collector roots, shared across the whole cluster. Each row roots a
+-- store path; `link` is the cluster-unique identifier of the root (e.g. the
+-- absolute path of a gcroots symlink). This replaces the per-node gcroots
+-- directory scan: every node registers its roots here and the collector reads
+-- the union.
+create table if not exists GCRoots (
+    link text primary key,
+    path text not null
+);
+
+create index if not exists IndexGCRootsPath on GCRoots(path);
+
+-- Single-row lease ensuring at most one node runs the garbage collector at a
+-- time. A node acquires the lease by claiming the row when it is unheld or its
+-- lease has expired; `expires` (epoch seconds) bounds a crashed holder.
+create table if not exists GCLease (
+    id      integer primary key,                   -- always 1 (single lease)
+    holder  text,                                  -- node id currently holding it
+    expires bigint not null                        -- epoch seconds when it lapses
+);

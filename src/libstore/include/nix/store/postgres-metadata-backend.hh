@@ -77,6 +77,12 @@ struct PostgresMetadataBackend : MetadataBackend
     void registerDrvOutput(const Realisation & info) override;
     std::optional<UnkeyedRealisation> queryRealisation(const DrvOutput & id) override;
 
+    void addRoot(const std::string & link, const StorePath & path) override;
+    std::map<StorePath, std::set<std::string>> queryRoots() override;
+    void removeValidPaths(const StorePathSet & paths) override;
+    bool acquireGCLease(const std::string & holder, uint64_t ttlSeconds) override;
+    void releaseGCLease(const std::string & holder) override;
+
     /**
      * Record the static output mapping of a derivation.
      *

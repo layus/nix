@@ -87,8 +87,16 @@ See `smoke-test.sh` to reproduce.
       populatable (`nix copy --to distributed://…`) and queryable.
 - [ ] Atomic derivation-output registration (fold `registerDerivationOutputs`
       into `registerValidPaths`).
-- [ ] DB-coordinated GC: roots table + GC lease (replaces gc-socket and
-      `/proc`-local liveness); `findRoots`/`collectGarbage` (currently throw).
+- [x] DB-coordinated GC: a shared `GCRoots` table (replacing the per-node
+      gcroots scan) and a single-row `GCLease` (one collector at a time).
+      `addPermRoot` registers roots, `findRoots` reads the cluster-wide union,
+      and `collectGarbage` does a lease-guarded mark-and-sweep (live = closure
+      of roots over references; dead set deleted from the shared FS and the
+      database). Runtime-validated on CockroachDB: closure preserved, garbage
+      collected, lease mutual-exclusion enforced.
+- [ ] GC liveness across in-use paths: report per-node temp/runtime roots
+      (`/proc`) into the DB so the collector never deletes a path in use on
+      another node. (Currently only explicit roots protect paths.)
 - [ ] gRPC transport + pluggable auth (app-keys first).
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).

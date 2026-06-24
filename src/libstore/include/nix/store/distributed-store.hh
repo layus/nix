@@ -124,6 +124,9 @@ private:
     void anchor() override;
 
     std::unique_ptr<MetadataBackend> backend;
+
+    /** Identifies this process/node when holding the cluster GC lease. */
+    std::string nodeId;
 };
 
 } // namespace nix

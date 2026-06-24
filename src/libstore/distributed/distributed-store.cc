@@ -15,6 +15,9 @@
 #  include "nix/util/file-system.hh"
 #  include "nix/util/source-accessor.hh"
 #  include "nix/util/file-content-address.hh"
+#  include "nix/util/finally.hh"
+
+#  include <unistd.h>
 
 namespace nix {
 
@@ -74,6 +77,10 @@ DistributedStore::DistributedStore(ref<const Config> config)
         throw UsageError("the 'metadata-db-url' setting is required for a distributed store");
     createDirs(config->realStoreDir.get());
     backend = std::make_unique<PostgresMetadataBackend>(*config, config->metadataDbUrl.get());
+
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    nodeId = std::string(host) + ":" + std::to_string(getpid());
 }
 
 DistributedStore::~DistributedStore() = default;
@@ -271,19 +278,88 @@ StorePath DistributedStore::addToStoreFromDump(
     return dstPath;
 }
 
-Roots DistributedStore::findRoots(bool)
+std::filesystem::path DistributedStore::addPermRoot(const StorePath & storePath, const std::filesystem::path & gcRoot)
 {
-    throw Error("garbage collection is not yet supported on the distributed store");
+    /* Create the user-visible symlink locally, and register the root in the
+       shared database so every node's collector sees it. */
+    replaceSymlink(printStorePath(storePath), gcRoot);
+    backend->addRoot(gcRoot.string(), storePath);
+    return gcRoot;
 }
 
-void DistributedStore::collectGarbage(const GCOptions &, GCResults &)
+Roots DistributedStore::findRoots(bool censor)
 {
-    throw Error("garbage collection is not yet supported on the distributed store");
+    Roots roots;
+    for (auto & [path, links] : backend->queryRoots()) {
+        auto & set = roots[path];
+        for (auto & link : links)
+            set.insert(censor ? "{censored}" : link);
+    }
+    return roots;
 }
 
-std::filesystem::path DistributedStore::addPermRoot(const StorePath &, const std::filesystem::path &)
+void DistributedStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
-    throw Error("'addPermRoot' is not yet supported on the distributed store");
+    /* Cluster-wide mutual exclusion: only one node collects at a time. */
+    if (!backend->acquireGCLease(nodeId, /*ttlSeconds=*/3600))
+        throw Error("another node is currently running garbage collection on this store");
+    Finally releaseLease([&]() { backend->releaseGCLease(nodeId); });
+
+    /* Mark: the live set is the closure of all cluster roots over references. */
+    StorePathSet rootPaths;
+    for (auto & [path, links] : backend->queryRoots())
+        rootPaths.insert(path);
+
+    StorePathSet live;
+    if (!options.ignoreLiveness)
+        computeFSClosure(rootPaths, live);
+
+    if (options.action == GCOptions::gcReturnLive) {
+        for (auto & p : live)
+            results.paths.insert(printStorePath(p));
+        return;
+    }
+
+    /* Sweep: dead = all valid paths not in the live set. */
+    StorePathSet dead;
+    for (auto & p : backend->queryAllValidPaths())
+        if (!live.count(p))
+            dead.insert(p);
+
+    if (options.action == GCOptions::gcReturnDead) {
+        for (auto & p : dead)
+            results.paths.insert(printStorePath(p));
+        return;
+    }
+
+    /* Decide what to delete. */
+    StorePathSet candidates;
+    if (options.action == GCOptions::gcDeleteSpecific) {
+        auto & specific = std::get<GCOptions::SpecificPaths>(options.pathsToDelete);
+        for (auto & p : specific.paths) {
+            if (!options.ignoreLiveness && !dead.count(p))
+                throw Error("cannot delete path '%s' since it is still live", printStorePath(p));
+            candidates.insert(p);
+        }
+    } else
+        candidates = dead;
+
+    /* Delete content from the shared filesystem, honouring `maxFreed`, and
+       remove exactly what we deleted from the metadata. `removeValidPaths`
+       drops every reference edge touching the set first, so deleting an
+       arbitrary subset never trips the foreign key. */
+    StorePathSet deleted;
+    for (auto & p : candidates) {
+        if (results.bytesFreed >= options.maxFreed)
+            break;
+        uint64_t freed = 0;
+        deletePath(toRealPath(p), freed);
+        results.bytesFreed += freed;
+        results.paths.insert(printStorePath(p));
+        deleted.insert(p);
+    }
+
+    backend->removeValidPaths(deleted);
 }
 
 std::optional<std::string> DistributedStore::getBuildLogExact(const StorePath &)

@@ -159,6 +159,42 @@ struct MetadataBackend
      * Look up the realisation of derivation output `id`, if known.
      */
     virtual std::optional<UnkeyedRealisation> queryRealisation(const DrvOutput & id) = 0;
+
+    /* ------------------------------------------------------------------ *
+     * Garbage collection (cluster-coordinated)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Register `path` as rooted by `link` (a cluster-unique root identifier).
+     * Upsert: re-registering the same link repoints it.
+     */
+    virtual void addRoot(const std::string & link, const StorePath & path) = 0;
+
+    /**
+     * All garbage-collector roots across the whole cluster, as a map from
+     * rooted store path to the set of root identifiers rooting it.
+     */
+    virtual std::map<StorePath, std::set<std::string>> queryRoots() = 0;
+
+    /**
+     * Atomically remove a set of paths (and all their references) from the
+     * metadata. The set MUST be closed under referrers — i.e. no path outside
+     * the set references a path inside it — which holds for the dead set
+     * computed by a mark-and-sweep. Used by the collector.
+     */
+    virtual void removeValidPaths(const StorePathSet & paths) = 0;
+
+    /**
+     * Try to acquire the single cluster-wide GC lease for `holder`, valid for
+     * `ttlSeconds`. Returns false if another holder's lease is still valid.
+     * Acquiring renews/extends the lease if `holder` already holds it.
+     */
+    virtual bool acquireGCLease(const std::string & holder, uint64_t ttlSeconds) = 0;
+
+    /**
+     * Release the GC lease if held by `holder` (no-op otherwise).
+     */
+    virtual void releaseGCLease(const std::string & holder) = 0;
 };
 
 } // namespace nix
