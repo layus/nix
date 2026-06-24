@@ -21,6 +21,12 @@
 
 namespace nix {
 
+/* How long a temp root stays valid, and how often the heartbeat renews this
+   node's temp roots. The interval must be comfortably below the TTL so a root
+   never lapses while its node is alive. */
+static constexpr uint64_t tempRootTtlSeconds = 600;
+static constexpr unsigned tempRootHeartbeatSeconds = 200;
+
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
@@ -81,9 +87,37 @@ DistributedStore::DistributedStore(ref<const Config> config)
     char host[256] = {0};
     gethostname(host, sizeof(host) - 1);
     nodeId = std::string(host) + ":" + std::to_string(getpid());
+
+    /* Keep this node's temp roots alive for as long as the store is open. */
+    heartbeatThread = std::thread([this]() {
+        std::unique_lock<std::mutex> lk(heartbeatMutex);
+        while (!heartbeatStop) {
+            heartbeatCv.wait_for(lk, std::chrono::seconds(tempRootHeartbeatSeconds), [this]() {
+                return heartbeatStop;
+            });
+            if (heartbeatStop)
+                break;
+            lk.unlock();
+            try {
+                backend->renewTempRoots(nodeId, tempRootTtlSeconds);
+            } catch (...) {
+                /* Don't let a transient database error kill the heartbeat. */
+            }
+            lk.lock();
+        }
+    });
 }
 
-DistributedStore::~DistributedStore() = default;
+DistributedStore::~DistributedStore()
+{
+    {
+        std::lock_guard<std::mutex> lk(heartbeatMutex);
+        heartbeatStop = true;
+    }
+    heartbeatCv.notify_all();
+    if (heartbeatThread.joinable())
+        heartbeatThread.join();
+}
 
 void DistributedStore::anchor() {}
 
@@ -162,6 +196,9 @@ void DistributedStore::addToStore(
     if (checkSigs && pathInfoIsUntrusted(info))
         throw Error(
             "cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
+
+    /* Protect the path from a concurrent collector on any node while we add it. */
+    addTempRoot(info.path);
 
     if (!repair && isValidPath(info.path))
         return;
@@ -246,6 +283,9 @@ StorePath DistributedStore::addToStoreFromDump(
 
     auto dstPath = makeFixedOutputPathFromCA(name, desc);
 
+    /* Protect the path from a concurrent collector on any node. */
+    addTempRoot(dstPath);
+
     if (!repair && isValidPath(dstPath))
         return dstPath;
 
@@ -305,10 +345,13 @@ void DistributedStore::collectGarbage(const GCOptions & options, GCResults & res
         throw Error("another node is currently running garbage collection on this store");
     Finally releaseLease([&]() { backend->releaseGCLease(nodeId); });
 
-    /* Mark: the live set is the closure of all cluster roots over references. */
+    /* Mark: the live set is the closure, over references, of all cluster
+       roots *and* every non-expired temp root (paths in use on any node). */
     StorePathSet rootPaths;
     for (auto & [path, links] : backend->queryRoots())
         rootPaths.insert(path);
+    for (auto & p : backend->queryLiveTempRoots())
+        rootPaths.insert(p);
 
     StorePathSet live;
     if (!options.ignoreLiveness)
@@ -375,6 +418,11 @@ void DistributedStore::addBuildLog(const StorePath &, std::string_view)
 std::optional<TrustedFlag> DistributedStore::isTrustedClient()
 {
     return Trusted;
+}
+
+void DistributedStore::addTempRoot(const StorePath & path)
+{
+    backend->addTempRoot(nodeId, path, tempRootTtlSeconds);
 }
 
 static RegisterStoreImplementation<DistributedStore::Config> regDistributedStore;

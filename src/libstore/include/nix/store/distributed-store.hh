@@ -8,7 +8,10 @@
 #  include "nix/store/local-fs-store.hh"
 #  include "nix/store/metadata-backend.hh"
 
+#  include <condition_variable>
 #  include <memory>
+#  include <mutex>
+#  include <thread>
 
 namespace nix {
 
@@ -120,13 +123,26 @@ struct DistributedStore : virtual LocalFSStore
 
     std::optional<TrustedFlag> isTrustedClient() override;
 
+    /**
+     * Register `path` as a temporary root in the shared database so that no
+     * node's collector deletes it while it is in use here. Kept alive by the
+     * heartbeat thread until this store is destroyed.
+     */
+    void addTempRoot(const StorePath & path) override;
+
 private:
     void anchor() override;
 
     std::unique_ptr<MetadataBackend> backend;
 
-    /** Identifies this process/node when holding the cluster GC lease. */
+    /** Identifies this process/node for the GC lease and temp roots. */
     std::string nodeId;
+
+    /** Background heartbeat that keeps this node's temp roots alive. */
+    std::thread heartbeatThread;
+    std::mutex heartbeatMutex;
+    std::condition_variable heartbeatCv;
+    bool heartbeatStop = false;
 };
 
 } // namespace nix

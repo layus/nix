@@ -98,3 +98,17 @@ create table if not exists GCLease (
     holder  text,                                  -- node id currently holding it
     expires bigint not null                        -- epoch seconds when it lapses
 );
+
+-- Per-node temporary roots: paths a node is actively using (e.g. a path being
+-- copied/realised) and must not be collected. Each node keeps its rows alive
+-- with a heartbeat that pushes `expires` forward; a crashed node's temp roots
+-- lapse once `expires` passes. The collector treats every non-expired temp
+-- root as a GC root, so a path in use on any node is protected cluster-wide.
+create table if not exists TempRoots (
+    node    text not null,
+    path    text not null,
+    expires bigint not null,                       -- epoch seconds when it lapses
+    primary key (node, path)
+);
+
+create index if not exists IndexTempRootsExpires on TempRoots(expires);

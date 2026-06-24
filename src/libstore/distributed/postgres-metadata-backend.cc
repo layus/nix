@@ -197,6 +197,13 @@ void PostgresMetadataBackend::initSchema()
             holder  text,
             expires bigint not null
         );
+        create table if not exists TempRoots (
+            node    text not null,
+            path    text not null,
+            expires bigint not null,
+            primary key (node, path)
+        );
+        create index if not exists IndexTempRootsExpires on TempRoots(expires);
     )sql";
     exec(schema);
 }
@@ -552,6 +559,34 @@ void PostgresMetadataBackend::releaseGCLease(const std::string & holder)
 {
     auto lock = std::scoped_lock(mutex);
     Result(execParams("update GCLease set holder = NULL, expires = 0 where holder = $1", {holder}));
+}
+
+void PostgresMetadataBackend::addTempRoot(const std::string & node, const StorePath & path, uint64_t ttlSeconds)
+{
+    auto lock = std::scoped_lock(mutex);
+    int64_t expires = (int64_t) time(nullptr) + (int64_t) ttlSeconds;
+    Result(execParams(
+        "insert into TempRoots (node, path, expires) values ($1, $2, $3) "
+        "on conflict (node, path) do update set expires = excluded.expires",
+        {node, store.printStorePath(path), std::to_string(expires)}));
+}
+
+void PostgresMetadataBackend::renewTempRoots(const std::string & node, uint64_t ttlSeconds)
+{
+    auto lock = std::scoped_lock(mutex);
+    int64_t expires = (int64_t) time(nullptr) + (int64_t) ttlSeconds;
+    Result(execParams("update TempRoots set expires = $1 where node = $2", {std::to_string(expires), node}));
+}
+
+StorePathSet PostgresMetadataBackend::queryLiveTempRoots()
+{
+    auto lock = std::scoped_lock(mutex);
+    int64_t now = (int64_t) time(nullptr);
+    Result res(execParams("select distinct path from TempRoots where expires > $1", {std::to_string(now)}));
+    StorePathSet paths;
+    for (int i = 0; i < res.ntuples(); ++i)
+        paths.insert(store.parseStorePath(res.get(i, 0)));
+    return paths;
 }
 
 } // namespace nix

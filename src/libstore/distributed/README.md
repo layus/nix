@@ -94,9 +94,16 @@ See `smoke-test.sh` to reproduce.
       of roots over references; dead set deleted from the shared FS and the
       database). Runtime-validated on CockroachDB: closure preserved, garbage
       collected, lease mutual-exclusion enforced.
-- [ ] GC liveness across in-use paths: report per-node temp/runtime roots
-      (`/proc`) into the DB so the collector never deletes a path in use on
-      another node. (Currently only explicit roots protect paths.)
+- [x] GC liveness for in-use paths: a `TempRoots` table where each node
+      registers paths it is actively using (e.g. during `addToStore`), kept
+      alive by a per-node heartbeat and reclaimed by TTL after a crash. The
+      collector treats every non-expired temp root as a root, so a path in use
+      on any node is protected cluster-wide. Runtime-validated on CockroachDB:
+      a copied-but-unrooted path survives GC while its temp root is live and is
+      collected once it expires.
+- [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
+      running processes into `TempRoots`, for processes that hold a path
+      without going through `addTempRoot` (defence in depth).
 - [ ] gRPC transport + pluggable auth (app-keys first).
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
