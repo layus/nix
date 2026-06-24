@@ -112,9 +112,13 @@ See `smoke-test.sh` to reproduce.
       `addToStore` and server-streaming `narFromPath`. Runtime-validated against
       a CockroachDB-backed distributed store: query and copy to/from `grpc://`
       work, and the token check accepts the right token and rejects others.
-- [ ] Remaining gRPC ops: builds, GC, realisations, `getFSAccessor`,
-      `addToStoreFromDump` (currently throw/no-op over gRPC), and gRPC ↔ status
-      error mapping refinements.
+- [x] Remaining gRPC ops fleshed out: reference queries, signatures,
+      realisations, roots, garbage collection (`GrpcStore` is now also a
+      `GcStore`), and `BuildPaths`. GC over `grpc://` runtime-validated against
+      the distributed store (garbage collected, rooted/temp-rooted paths kept).
+- [ ] Still unbridged over gRPC: `BuildDerivation`, `QueryMissing`,
+      `addToStoreFromDump`, `getFSAccessor`; build-log forwarding; gRPC ↔ status
+      error-mapping refinements.
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket

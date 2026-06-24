@@ -88,10 +88,14 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       `NarFromPath`.
 - [x] `GrpcStore` client (`grpc://host:port`), `grpc-store.cc`.
 - [x] Preshared-token auth (`grpc-auth.cc`).
-- [ ] Remaining ops: `BuildPaths`/`BuildDerivation`, `CollectGarbage`/`FindRoots`/
-      `AddPermRoot`/`AddTempRoot`, `RegisterDrvOutput`/`QueryRealisation`,
-      `AddSignatures`, `QueryReferrers`/`QueryValidDerivers`/`QueryMissing`,
-      `addToStoreFromDump`, `getFSAccessor`.
+- [x] Reference queries (`QueryReferrers`, `QueryValidDerivers`), `AddSignatures`,
+      realisations (`RegisterDrvOutput`, `QueryRealisation`), roots/GC
+      (`AddTempRoot`, `AddPermRoot`, `FindRoots`, `CollectGarbage`), and
+      `BuildPaths`. `GrpcStore` is now also a `GcStore`. GC over `grpc://`
+      runtime-validated against the distributed store.
+- [ ] `BuildDerivation` (needs the derivation serialised over the wire),
+      `QueryMissing`, `addToStoreFromDump`, `getFSAccessor`; forwarding build
+      logs/progress through the `BuildEvent` stream (result-only for now).
 - [ ] Connection pooling/reconnect on the client; map errors ↔ gRPC status
       codes; deadlines/retries for idempotent RPCs.
 

@@ -10,6 +10,9 @@
 
 #  include "nix/store/store-api.hh"
 #  include "nix/store/path-info.hh"
+#  include "nix/store/realisation.hh"
+#  include "nix/store/gc-store.hh"
+#  include "nix/store/build-result.hh"
 #  include "nix/util/hash.hh"
 
 #  include "nix-store.pb.h"
@@ -73,6 +76,45 @@ inline ValidPathInfo fromProto(const StoreDirConfig & store, const pb::PathInfo 
     info.ultimate = in.ultimate();
     info.registrationTime = in.registration_time();
     return info;
+}
+
+/** Fill a proto `Realisation` from `id` + an (unkeyed) realisation. */
+inline void toProto(const StoreDirConfig & store, const DrvOutput & id, const UnkeyedRealisation & r, pb::Realisation & out)
+{
+    out.set_drv_output(id.to_string());
+    out.set_out_path(store.printStorePath(r.outPath));
+    for (auto & sig : r.signatures)
+        out.add_signatures(sig.to_string());
+}
+
+/** Build a keyed `Realisation` from a proto message. */
+inline Realisation fromProto(const StoreDirConfig & store, const pb::Realisation & in)
+{
+    Realisation r{
+        UnkeyedRealisation{.outPath = store.parseStorePath(in.out_path())},
+        DrvOutput::parse(store, in.drv_output()),
+    };
+    for (auto & sig : in.signatures())
+        r.signatures.insert(Signature::parse(sig));
+    return r;
+}
+
+inline BuildMode fromProto(pb::BuildMode m)
+{
+    if (m == pb::REPAIR)
+        return bmRepair;
+    if (m == pb::CHECK)
+        return bmCheck;
+    return bmNormal;
+}
+
+inline pb::BuildMode toProtoMode(BuildMode m)
+{
+    if (m == bmRepair)
+        return pb::REPAIR;
+    if (m == bmCheck)
+        return pb::CHECK;
+    return pb::NORMAL;
 }
 
 /**

@@ -4,11 +4,15 @@
 
 #  include "grpc-common.hh"
 #  include "nix/store/store-registration.hh"
+#  include "nix/store/gc-store.hh"
+#  include "nix/store/derived-path.hh"
 #  include "nix/util/callback.hh"
 
 #  include "nix-store.grpc.pb.h"
 
 #  include <grpcpp/grpcpp.h>
+
+#  include <limits>
 
 namespace nix {
 
@@ -61,7 +65,7 @@ private:
 
 namespace grpc_transport {
 
-struct GrpcStore : virtual Store
+struct GrpcStore : virtual Store, virtual GcStore
 {
     using Config = GrpcStoreConfig;
 
@@ -197,23 +201,174 @@ struct GrpcStore : virtual Store
             fail(s);
     }
 
+    void queryReferrers(const StorePath & path, StorePathSet & referrers) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::StorePathRequest req;
+        req.set_path(printStorePath(path));
+        pb::StorePathsReply resp;
+        auto s = stub->QueryReferrers(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+        for (auto & p : resp.paths())
+            referrers.insert(parseStorePath(p));
+    }
+
+    StorePathSet queryValidDerivers(const StorePath & path) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::StorePathRequest req;
+        req.set_path(printStorePath(path));
+        pb::StorePathsReply resp;
+        auto s = stub->QueryValidDerivers(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+        StorePathSet res;
+        for (auto & p : resp.paths())
+            res.insert(parseStorePath(p));
+        return res;
+    }
+
+    void addSignatures(const StorePath & storePath, const std::set<Signature> & sigs) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::AddSignaturesRequest req;
+        req.set_path(printStorePath(storePath));
+        for (auto & sig : sigs)
+            req.add_sigs(sig.to_string());
+        pb::Empty resp;
+        auto s = stub->AddSignatures(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+    }
+
+    void registerDrvOutput(const Realisation & info) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::Realisation req;
+        toProto(*this, info.id, info, req);
+        pb::Empty resp;
+        auto s = stub->RegisterDrvOutput(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+    }
+
+    void queryRealisationUncached(
+        const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override
+    {
+        try {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            pb::DrvOutputRequest req;
+            req.set_drv_output(id.to_string());
+            pb::OptionalRealisationReply resp;
+            auto s = stub->QueryRealisation(&ctx, req, &resp);
+            if (!s.ok())
+                fail(s);
+            if (resp.has_realisation())
+                callback(std::make_shared<const UnkeyedRealisation>(fromProto(*this, resp.realisation())));
+            else
+                callback(nullptr);
+        } catch (...) {
+            callback.rethrow();
+        }
+    }
+
+    void addTempRoot(const StorePath & path) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::StorePathRequest req;
+        req.set_path(printStorePath(path));
+        pb::Empty resp;
+        auto s = stub->AddTempRoot(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+    }
+
+    void buildPaths(const std::vector<DerivedPath> & paths, BuildMode mode, std::shared_ptr<Store> evalStore) override
+    {
+        if (evalStore && evalStore.get() != this)
+            throw Error("a separate evaluation store is not supported over the gRPC store");
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::BuildPathsRequest req;
+        for (auto & p : paths)
+            req.add_drvd_paths(p.to_string(*this));
+        req.set_mode(grpc_transport::toProtoMode(mode));
+        auto reader = stub->BuildPaths(&ctx, req);
+        pb::BuildEvent ev;
+        bool ok = true;
+        std::string err;
+        while (reader->Read(&ev)) {
+            if (ev.has_result()) {
+                ok = ev.result().success();
+                err = ev.result().error();
+            }
+            // TODO: forward ev.log_line()/ev.activity() to the local logger.
+        }
+        auto s = reader->Finish();
+        if (!s.ok())
+            fail(s);
+        if (!ok)
+            throw Error("build failed on the remote gRPC store: %s", err);
+    }
+
+    Roots findRoots(bool censor) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::Empty req;
+        pb::RootsReply resp;
+        auto s = stub->FindRoots(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+        Roots roots;
+        for (auto & [path, links] : resp.roots()) {
+            auto & set = roots[parseStorePath(path)];
+            for (auto & link : links.paths())
+                set.insert(link);
+        }
+        return roots;
+    }
+
+    void collectGarbage(const GCOptions & options, GCResults & results) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::GCRequest req;
+        if (options.action == GCOptions::gcReturnLive)
+            req.set_action(pb::GCRequest::RETURN_LIVE);
+        else if (options.action == GCOptions::gcReturnDead)
+            req.set_action(pb::GCRequest::RETURN_DEAD);
+        else if (options.action == GCOptions::gcDeleteSpecific) {
+            req.set_action(pb::GCRequest::DELETE_SPECIFIC);
+            for (auto & p : std::get<GCOptions::SpecificPaths>(options.pathsToDelete).paths)
+                req.add_paths_to_delete(printStorePath(p));
+        } else
+            req.set_action(pb::GCRequest::DELETE_DEAD);
+        req.set_ignore_liveness(options.ignoreLiveness);
+        if (options.maxFreed != std::numeric_limits<uint64_t>::max())
+            req.set_max_freed(options.maxFreed);
+        pb::GCReply resp;
+        auto s = stub->CollectGarbage(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+        for (auto & p : resp.paths())
+            results.paths.insert(p);
+        results.bytesFreed = resp.bytes_freed();
+    }
+
     /* --- not yet bridged over gRPC --- */
     StorePath addToStoreFromDump(
         Source &, std::string_view, FileSerialisationMethod, ContentAddressMethod, HashAlgorithm, const StorePathSet &,
         RepairFlag) override
     {
         throw Error("'addToStoreFromDump' is not yet supported over the gRPC store");
-    }
-
-    void registerDrvOutput(const Realisation &) override
-    {
-        throw Error("'registerDrvOutput' is not yet supported over the gRPC store");
-    }
-
-    void queryRealisationUncached(
-        const DrvOutput &, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override
-    {
-        callback(nullptr);
     }
 
     ref<SourceAccessor> getFSAccessor(bool) override
