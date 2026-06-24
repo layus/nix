@@ -498,6 +498,18 @@ this_library = library(
 
 install_headers(headers, subdir : 'nix/store', preserve_path : true)
 
+# Standalone launcher for the gRPC store server.
+if grpc_enabled
+  executable(
+    'nix-grpc-store-server',
+    'distributed/grpc-server-main.cc',
+    link_with : this_library,
+    dependencies : deps_public + deps_private + deps_other,
+    include_directories : include_dirs,
+    install : false,
+  )
+endif
+
 libraries_private = []
 
 extra_pkg_config_variables = {
