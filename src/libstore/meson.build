@@ -374,6 +374,11 @@ if s3_aws_auth.enabled()
   sources += files('aws-creds.cc')
 endif
 
+# Experimental PostgreSQL/YugabyteDB metadata backend, only compiled with libpq.
+if libpq.found()
+  sources += files('distributed/postgres-metadata-backend.cc')
+endif
+
 subdir('include/nix/store')
 
 if host_machine.system() == 'linux'

@@ -61,6 +61,7 @@ headers = [ config_pub_h ] + files(
   'make-content-addressed.hh',
   'metadata-backend.hh',
   'names.hh',
+  'postgres-metadata-backend.hh',
   'nar-info-disk-cache.hh',
   'nar-info.hh',
   'outputs-query.hh',
