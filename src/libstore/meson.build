@@ -376,7 +376,10 @@ endif
 
 # Experimental PostgreSQL/YugabyteDB metadata backend, only compiled with libpq.
 if libpq.found()
-  sources += files('distributed/postgres-metadata-backend.cc')
+  sources += files(
+    'distributed/postgres-metadata-backend.cc',
+    'distributed/distributed-store.cc',
+  )
 endif
 
 subdir('include/nix/store')
