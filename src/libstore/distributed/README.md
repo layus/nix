@@ -60,8 +60,10 @@ distributed work adds a second implementation behind this interface.
       as `distributed://`; additive (does not touch `LocalStore`/SQLite).
       Read/query/registration routed to the backend; content from the
       shared filesystem. (Compiles; runtime testing pending a database.)
-- [ ] `addToStore` on `DistributedStore` — write content to the shared
-      filesystem and register metadata via the backend (currently throws).
+- [x] `addToStore` / `addToStoreFromDump` on `DistributedStore` — write
+      content to the shared filesystem (NAR import and content-addressed
+      adds) and register metadata via the backend. The store is now fully
+      populatable (`nix copy --to distributed://…`) and queryable.
 - [ ] Atomic derivation-output registration (fold `registerDerivationOutputs`
       into `registerValidPaths`).
 - [ ] DB-coordinated GC: roots table + GC lease (replaces gc-socket and
