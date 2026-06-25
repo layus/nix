@@ -119,9 +119,14 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       activity text as `BuildEvent` `log_line`s; the client replays them
       through its local logger, so `nix ... -L` shows the remote build output.
       Runtime-validated: a build's stdout streamed back over gRPC.
+- [x] `buildPathsWithResults` forwarding, so `nix build --store grpc://` works
+      (it uses this entry point, not `buildPaths`). Mirrors RemoteStore's
+      fallback: forward the build via `buildPaths`, then synthesise the
+      per-path `KeyedBuildResult`s by resolving each derived path's outputs.
+      Validated: `nix build --store grpc://` forwards the build and streams its
+      logs, behaving identically to a direct build.
 - [ ] Map errors ↔ gRPC status codes; richer activity/progress forwarding;
-      `buildPathsWithResults` forwarding (so `nix build --store grpc://` works,
-      not just `nix-store --realise`); node-discovery beyond a static list.
+      node-discovery beyond a static list (DNS / coordinator).
 
 ## How it composes with the rest
 

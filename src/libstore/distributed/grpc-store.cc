@@ -427,6 +427,46 @@ struct GrpcStore : virtual Store, virtual GcStore
             throw Error("build failed on the remote gRPC store: %s", err);
     }
 
+    std::vector<KeyedBuildResult>
+    buildPathsWithResults(const std::vector<DerivedPath> & paths, BuildMode buildMode, std::shared_ptr<Store> evalStore)
+        override
+    {
+        /* Forward the build (streams logs, throws on failure), then synthesise
+           the per-path results -- mirroring RemoteStore's pre-1.34 fallback so
+           that `nix build --store grpc://...` works (it uses this entry point,
+           not buildPaths). */
+        buildPaths(paths, buildMode, evalStore);
+
+        Store & eval = evalStore ? *evalStore : *this;
+        std::vector<KeyedBuildResult> results;
+        for (auto & path : paths) {
+            std::visit(
+                overloaded{
+                    [&](const DerivedPath::Opaque & bo) {
+                        results.push_back(KeyedBuildResult{
+                            {.inner{BuildResult::Success{.status = BuildResult::Success::Substituted}}}, bo});
+                    },
+                    [&](const DerivedPath::Built & bfd) {
+                        BuildResult::Success success{.status = BuildResult::Success::Built};
+                        auto drvPath = resolveDerivedPath(eval, *bfd.drvPath);
+                        auto built = resolveDerivedPath(*this, bfd, evalStore.get());
+                        for (auto & [output, outputPath] : built) {
+                            auto outputId = DrvOutput{drvPath, output};
+                            if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
+                                auto realisation = queryRealisation(outputId);
+                                if (!realisation)
+                                    throw MissingRealisation(*this, outputId);
+                                success.builtOutputs.emplace(output, *realisation);
+                            } else
+                                success.builtOutputs.emplace(output, UnkeyedRealisation{.outPath = outputPath});
+                        }
+                        results.push_back(KeyedBuildResult{{.inner = std::move(success)}, bfd});
+                    }},
+                path.raw());
+        }
+        return results;
+    }
+
     BuildResult buildDerivation(const StorePath & drvPath, const BasicDerivation & drv, BuildMode mode) override
     {
         pb::BuildDerivationRequest req;

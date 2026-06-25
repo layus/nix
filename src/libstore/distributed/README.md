@@ -129,8 +129,12 @@ See `smoke-test.sh` to reproduce.
       success) so even a mid-stream node death just restarts elsewhere.
       Runtime-validated (kill a node; queries, copies to/from, add-file, cat,
       and GC all fail over to a live node).
-- [ ] Build-log/progress forwarding over the `BuildEvent` stream; gRPC ↔ status
-      error-mapping refinements; dynamic node discovery (DNS / coordinator).
+- [x] Builds over gRPC: `nix-store --realise` and `nix build --store grpc://`
+      both forward the build (the latter via `buildPathsWithResults`), with the
+      builder's output streamed back live (`-L`). Behaves identically to a
+      direct build.
+- [ ] gRPC ↔ status error-mapping refinements; richer progress forwarding;
+      dynamic node discovery (DNS / coordinator).
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
