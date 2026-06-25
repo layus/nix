@@ -6,11 +6,13 @@
 #  include "nix/store/store-registration.hh"
 #  include "nix/store/gc-store.hh"
 #  include "nix/store/derived-path.hh"
+#  include "nix/store/derivations.hh"
 #  include "nix/util/callback.hh"
 
 #  include "nix-store.grpc.pb.h"
 
 #  include <grpcpp/grpcpp.h>
+#  include <nlohmann/json.hpp>
 
 #  include <limits>
 
@@ -316,6 +318,47 @@ struct GrpcStore : virtual Store, virtual GcStore
             fail(s);
         if (!ok)
             throw Error("build failed on the remote gRPC store: %s", err);
+    }
+
+    BuildResult buildDerivation(const StorePath & drvPath, const BasicDerivation & drv, BuildMode mode) override
+    {
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::BuildDerivationRequest req;
+        req.set_drv_path(printStorePath(drvPath));
+        /* Send the derivation as a JSON blob. */
+        nlohmann::json j = drv;
+        req.set_drv(j.dump());
+        req.set_mode(grpc_transport::toProtoMode(mode));
+
+        auto reader = stub->BuildDerivation(&ctx, req);
+        pb::BuildEvent ev;
+        std::optional<BuildResult> result;
+        while (reader->Read(&ev)) {
+            if (!ev.has_result())
+                continue; // TODO: forward log/activity events
+            auto & pr = ev.result();
+            BuildResult br;
+            if (pr.success()) {
+                BuildResult::Success success;
+                success.status = BuildResult::Success::Built;
+                for (auto & [outputName, rm] : pr.built_outputs()) {
+                    UnkeyedRealisation realisation{.outPath = parseStorePath(rm.out_path())};
+                    for (auto & sig : rm.signatures())
+                        realisation.signatures.insert(Signature::parse(sig));
+                    success.builtOutputs.insert_or_assign(outputName, realisation);
+                }
+                br.inner = std::move(success);
+            } else
+                br.inner = BuildError(BuildResultFailureStatus::MiscFailure, "%s", pr.error());
+            result = std::move(br);
+        }
+        auto s = reader->Finish();
+        if (!s.ok())
+            fail(s);
+        if (!result)
+            throw Error("no build result returned from the remote gRPC store");
+        return *result;
     }
 
     Roots findRoots(bool censor) override

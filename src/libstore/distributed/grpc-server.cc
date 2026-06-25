@@ -8,8 +8,11 @@
 #  include "nix/store/gc-store.hh"
 #  include "nix/store/local-fs-store.hh"
 #  include "nix/store/derived-path.hh"
+#  include "nix/store/derivations.hh"
 
 #  include "nix-store.grpc.pb.h"
+
+#  include <nlohmann/json.hpp>
 
 #  include <grpcpp/grpcpp.h>
 #  include <grpcpp/server_builder.h>
@@ -258,6 +261,40 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                 auto * r = ev.mutable_result();
                 r->set_success(false);
                 r->set_error(e.msg());
+            }
+            writer->Write(ev);
+        });
+    }
+
+    Status BuildDerivation(
+        ServerContext * ctx, const pb::BuildDerivationRequest * req, grpc::ServerWriter<pb::BuildEvent> * writer)
+        override
+    {
+        if (auto s = checkAuth(*ctx, token); !s.ok())
+            return s;
+        return guarded([&]() {
+            auto drvPath = store->parseStorePath(req->drv_path());
+            /* The derivation travels as a JSON blob in `drv`. It is a
+               `BasicDerivation` (what `buildDerivation` needs), serialised and
+               parsed with the same `adl_serializer` on both ends. */
+            BasicDerivation drv = static_cast<BasicDerivation>(nlohmann::json::parse(req->drv()));
+
+            auto result = store->buildDerivation(drvPath, drv, fromProto(req->mode()));
+
+            pb::BuildEvent ev;
+            auto * r = ev.mutable_result();
+            if (auto * success = result.tryGetSuccess()) {
+                r->set_success(true);
+                for (auto & [outputName, realisation] : success->builtOutputs) {
+                    pb::Realisation rm;
+                    rm.set_out_path(store->printStorePath(realisation.outPath));
+                    for (auto & sig : realisation.signatures)
+                        rm.add_signatures(sig.to_string());
+                    (*r->mutable_built_outputs())[outputName] = rm;
+                }
+            } else if (auto * failure = result.tryGetFailure()) {
+                r->set_success(false);
+                r->set_error(failure->msg());
             }
             writer->Write(ev);
         });

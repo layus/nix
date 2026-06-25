@@ -93,8 +93,12 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       (`AddTempRoot`, `AddPermRoot`, `FindRoots`, `CollectGarbage`), and
       `BuildPaths`. `GrpcStore` is now also a `GcStore`. GC over `grpc://`
       runtime-validated against the distributed store.
-- [ ] `BuildDerivation` (needs the derivation serialised over the wire),
-      `QueryMissing`, `addToStoreFromDump`, `getFSAccessor`; forwarding build
+- [x] `BuildDerivation`: the derivation travels as a **JSON blob** in the
+      request (`BuildDerivationRequest.drv`), serialised and parsed with Nix's
+      standard `BasicDerivation` `adl_serializer` on both ends. The result
+      (success + built outputs, or the error) comes back on the `BuildEvent`
+      stream.
+- [ ] `QueryMissing`, `addToStoreFromDump`, `getFSAccessor`; forwarding build
       logs/progress through the `BuildEvent` stream (result-only for now).
 - [ ] Connection pooling/reconnect on the client; map errors ↔ gRPC status
       codes; deadlines/retries for idempotent RPCs.
