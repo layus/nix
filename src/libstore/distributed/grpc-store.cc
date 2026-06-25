@@ -11,13 +11,16 @@
 #  include "nix/store/remote-fs-accessor.hh"
 #  include "nix/util/file-content-address.hh"
 #  include "nix/util/callback.hh"
+#  include "nix/util/strings.hh"
 
 #  include "nix-store.grpc.pb.h"
 
 #  include <grpcpp/grpcpp.h>
 #  include <nlohmann/json.hpp>
 
+#  include <atomic>
 #  include <limits>
+#  include <vector>
 
 namespace nix {
 
@@ -38,6 +41,12 @@ struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual 
 
     Setting<std::string> authToken{
         this, "", "auth-token", "Preshared token sent in the `auth-token` header for authentication."};
+
+    Setting<std::string> nodes{
+        this,
+        "",
+        "nodes",
+        "Comma-separated list of cluster nodes (`host:port`) to fail over across. Defaults to the URI authority."};
 
     static const std::string name()
     {
@@ -79,9 +88,20 @@ struct GrpcStore : virtual Store, virtual GcStore
     GrpcStore(ref<const Config> config)
         : Store{*config}
         , config{config}
-        , stub(pb::NixStore::NewStub(
-              grpc::CreateChannel(std::string(config->target), grpc::InsecureChannelCredentials())))
     {
+        /* The cluster nodes to fail over across: the `nodes` parameter if
+           given, otherwise the single node in the URI authority. */
+        auto list = config->nodes.get().empty()
+                        ? std::vector<std::string>{std::string(config->target)}
+                        : tokenizeString<std::vector<std::string>>(config->nodes.get(), ",");
+        for (auto & target : list) {
+            if (target.empty())
+                continue;
+            targets.push_back(target);
+            stubs.push_back(pb::NixStore::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials())));
+        }
+        if (stubs.empty())
+            throw UsageError("a 'grpc://' store must name at least one node (in the authority or the 'nodes' parameter)");
     }
 
     void anchor() override {}
@@ -98,31 +118,76 @@ struct GrpcStore : virtual Store, virtual GcStore
         throw Error("gRPC store error: %s", status.error_message());
     }
 
+    /* A status that means "this node is unreachable/unhealthy" (worth trying
+       another node), as opposed to the operation genuinely failing the same
+       way everywhere. */
+    static bool isNodeFailure(const grpc::Status & s)
+    {
+        auto c = s.error_code();
+        return c == grpc::StatusCode::UNAVAILABLE || c == grpc::StatusCode::DEADLINE_EXCEEDED;
+    }
+
+    /* Run `fn` against the cluster, starting at the last good node and
+       advancing to the next whenever a node is unreachable. A genuine
+       operation error is thrown immediately (it would fail the same on every
+       node). `canRetry()` is consulted before failing over: it returns false
+       once an operation has consumed un-replayable input/output (a streamed
+       NAR), in which case a mid-stream node failure is fatal. Throws if every
+       node is unreachable. */
+    template<typename Fn, typename CanRetry>
+    void withFailover(Fn fn, CanRetry canRetry)
+    {
+        size_t n = stubs.size();
+        size_t start = currentNode.load();
+        std::string lastError;
+        for (size_t i = 0; i < n; ++i) {
+            size_t idx = (start + i) % n;
+            grpc::Status s = fn(*stubs[idx]);
+            if (s.ok()) {
+                currentNode.store(idx);
+                return;
+            }
+            if (!isNodeFailure(s))
+                fail(s);
+            lastError = fmt("node '%s': %s", targets[idx], s.error_message());
+            if (!canRetry())
+                throw Error("gRPC node '%s' failed mid-operation and cannot be retried: %s", targets[idx], s.error_message());
+            debug("gRPC store: %s; trying next node", lastError);
+        }
+        throw Error("all %d gRPC cluster nodes are unreachable (last: %s)", n, lastError);
+    }
+
+    template<typename Fn>
+    void withFailover(Fn fn)
+    {
+        withFailover(std::move(fn), []() { return true; });
+    }
+
     bool isValidPathUncached(const StorePath & path) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathRequest req;
         req.set_path(printStorePath(path));
         pb::BoolReply resp;
-        auto s = stub->IsValidPath(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.IsValidPath(&ctx, req, &resp);
+        });
         return resp.value();
     }
 
     StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute = NoSubstitute) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathsRequest req;
         for (auto & p : paths)
             req.add_paths(printStorePath(p));
         req.set_substitute(maybeSubstitute == Substitute);
         pb::StorePathsReply resp;
-        auto s = stub->QueryValidPaths(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.QueryValidPaths(&ctx, req, &resp);
+        });
         StorePathSet res;
         for (auto & p : resp.paths())
             res.insert(parseStorePath(p));
@@ -133,14 +198,14 @@ struct GrpcStore : virtual Store, virtual GcStore
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
     {
         try {
-            grpc::ClientContext ctx;
-            auth(ctx);
             pb::StorePathRequest req;
             req.set_path(printStorePath(path));
             pb::PathInfoReply resp;
-            auto s = stub->QueryPathInfo(&ctx, req, &resp);
-            if (!s.ok())
-                fail(s);
+            withFailover([&](pb::NixStore::Stub & stub) {
+                grpc::ClientContext ctx;
+                auth(ctx);
+                return stub.QueryPathInfo(&ctx, req, &resp);
+            });
             if (resp.has_info())
                 callback(std::make_shared<ValidPathInfo>(fromProto(*this, resp.info())));
             else
@@ -152,14 +217,14 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::HashPartRequest req;
         req.set_hash_part(hashPart);
         pb::OptionalStorePathReply resp;
-        auto s = stub->QueryPathFromHashPart(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.QueryPathFromHashPart(&ctx, req, &resp);
+        });
         if (resp.has_path())
             return parseStorePath(resp.path());
         return std::nullopt;
@@ -167,69 +232,79 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     void addToStore(const ValidPathInfo & info, Source & source, RepairFlag, CheckSigsFlag) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
-        pb::PathInfoReply resp;
-        auto writer = stub->AddToStore(&ctx, &resp);
-
-        /* First message: the PathInfo. */
         pb::AddToStoreChunk head;
         toProto(*this, info, *head.mutable_info());
-        if (!writer->Write(head))
-            throw Error("gRPC AddToStore: failed to send path info");
-
-        /* Then stream the NAR as chunks. */
-        ChunkSink<grpc::ClientWriter<pb::AddToStoreChunk>, pb::AddToStoreChunk> sink(*writer, [](std::string_view d) {
-            pb::AddToStoreChunk c;
-            c.set_nar(std::string(d));
-            return c;
-        });
-        source.drainInto(sink);
-        writer->WritesDone();
-        auto s = writer->Finish();
-        if (!s.ok())
-            fail(s);
+        /* Once we start draining `source` it cannot be replayed, so we may only
+           fail over to another node before the first NAR byte is sent. */
+        bool started = false;
+        withFailover(
+            [&](pb::NixStore::Stub & stub) -> grpc::Status {
+                grpc::ClientContext ctx;
+                auth(ctx);
+                pb::PathInfoReply resp;
+                auto writer = stub.AddToStore(&ctx, &resp);
+                if (!writer->Write(head))
+                    return writer->Finish(); // header send failed; source untouched
+                started = true;
+                ChunkSink<grpc::ClientWriter<pb::AddToStoreChunk>, pb::AddToStoreChunk> sink(
+                    *writer, [](std::string_view d) {
+                        pb::AddToStoreChunk c;
+                        c.set_nar(std::string(d));
+                        return c;
+                    });
+                source.drainInto(sink);
+                writer->WritesDone();
+                return writer->Finish();
+            },
+            [&]() { return !started; });
     }
 
     void narFromPath(const StorePath & path, Sink & sink) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathRequest req;
         req.set_path(printStorePath(path));
-        auto reader = stub->NarFromPath(&ctx, req);
-        pb::NarChunk chunk;
-        while (reader->Read(&chunk))
-            sink(chunk.nar());
-        auto s = reader->Finish();
-        if (!s.ok())
-            fail(s);
+        /* Once we have written a byte to `sink` we cannot restart, so fail over
+           only before the first chunk arrives. */
+        bool wrote = false;
+        withFailover(
+            [&](pb::NixStore::Stub & stub) -> grpc::Status {
+                grpc::ClientContext ctx;
+                auth(ctx);
+                auto reader = stub.NarFromPath(&ctx, req);
+                pb::NarChunk chunk;
+                while (reader->Read(&chunk)) {
+                    wrote = true;
+                    sink(chunk.nar());
+                }
+                return reader->Finish();
+            },
+            [&]() { return !wrote; });
     }
 
     void queryReferrers(const StorePath & path, StorePathSet & referrers) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathRequest req;
         req.set_path(printStorePath(path));
         pb::StorePathsReply resp;
-        auto s = stub->QueryReferrers(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.QueryReferrers(&ctx, req, &resp);
+        });
         for (auto & p : resp.paths())
             referrers.insert(parseStorePath(p));
     }
 
     StorePathSet queryValidDerivers(const StorePath & path) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathRequest req;
         req.set_path(printStorePath(path));
         pb::StorePathsReply resp;
-        auto s = stub->QueryValidDerivers(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.QueryValidDerivers(&ctx, req, &resp);
+        });
         StorePathSet res;
         for (auto & p : resp.paths())
             res.insert(parseStorePath(p));
@@ -238,42 +313,42 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     void addSignatures(const StorePath & storePath, const std::set<Signature> & sigs) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::AddSignaturesRequest req;
         req.set_path(printStorePath(storePath));
         for (auto & sig : sigs)
             req.add_sigs(sig.to_string());
         pb::Empty resp;
-        auto s = stub->AddSignatures(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.AddSignatures(&ctx, req, &resp);
+        });
     }
 
     void registerDrvOutput(const Realisation & info) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::Realisation req;
         toProto(*this, info.id, info, req);
         pb::Empty resp;
-        auto s = stub->RegisterDrvOutput(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.RegisterDrvOutput(&ctx, req, &resp);
+        });
     }
 
     void queryRealisationUncached(
         const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override
     {
         try {
-            grpc::ClientContext ctx;
-            auth(ctx);
             pb::DrvOutputRequest req;
             req.set_drv_output(id.to_string());
             pb::OptionalRealisationReply resp;
-            auto s = stub->QueryRealisation(&ctx, req, &resp);
-            if (!s.ok())
-                fail(s);
+            withFailover([&](pb::NixStore::Stub & stub) {
+                grpc::ClientContext ctx;
+                auth(ctx);
+                return stub.QueryRealisation(&ctx, req, &resp);
+            });
             if (resp.has_realisation())
                 callback(std::make_shared<const UnkeyedRealisation>(fromProto(*this, resp.realisation())));
             else
@@ -285,48 +360,50 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     void addTempRoot(const StorePath & path) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathRequest req;
         req.set_path(printStorePath(path));
         pb::Empty resp;
-        auto s = stub->AddTempRoot(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.AddTempRoot(&ctx, req, &resp);
+        });
     }
 
     void buildPaths(const std::vector<DerivedPath> & paths, BuildMode mode, std::shared_ptr<Store> evalStore) override
     {
         if (evalStore && evalStore.get() != this)
             throw Error("a separate evaluation store is not supported over the gRPC store");
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::BuildPathsRequest req;
         for (auto & p : paths)
             req.add_drvd_paths(p.to_string(*this));
         req.set_mode(grpc_transport::toProtoMode(mode));
-        auto reader = stub->BuildPaths(&ctx, req);
-        pb::BuildEvent ev;
+        /* A build is re-run from scratch on failover (already-valid outputs
+           short-circuit), so the whole stream read is retriable. */
         bool ok = true;
         std::string err;
-        while (reader->Read(&ev)) {
-            if (ev.has_result()) {
-                ok = ev.result().success();
-                err = ev.result().error();
+        withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            ok = true;
+            err.clear();
+            auto reader = stub.BuildPaths(&ctx, req);
+            pb::BuildEvent ev;
+            while (reader->Read(&ev)) {
+                if (ev.has_result()) {
+                    ok = ev.result().success();
+                    err = ev.result().error();
+                }
+                // TODO: forward ev.log_line()/ev.activity() to the local logger.
             }
-            // TODO: forward ev.log_line()/ev.activity() to the local logger.
-        }
-        auto s = reader->Finish();
-        if (!s.ok())
-            fail(s);
+            return reader->Finish();
+        });
         if (!ok)
             throw Error("build failed on the remote gRPC store: %s", err);
     }
 
     BuildResult buildDerivation(const StorePath & drvPath, const BasicDerivation & drv, BuildMode mode) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::BuildDerivationRequest req;
         req.set_drv_path(printStorePath(drvPath));
         /* Send the derivation as a JSON blob. */
@@ -334,31 +411,34 @@ struct GrpcStore : virtual Store, virtual GcStore
         req.set_drv(j.dump());
         req.set_mode(grpc_transport::toProtoMode(mode));
 
-        auto reader = stub->BuildDerivation(&ctx, req);
-        pb::BuildEvent ev;
         std::optional<BuildResult> result;
-        while (reader->Read(&ev)) {
-            if (!ev.has_result())
-                continue; // TODO: forward log/activity events
-            auto & pr = ev.result();
-            BuildResult br;
-            if (pr.success()) {
-                BuildResult::Success success;
-                success.status = BuildResult::Success::Built;
-                for (auto & [outputName, rm] : pr.built_outputs()) {
-                    UnkeyedRealisation realisation{.outPath = parseStorePath(rm.out_path())};
-                    for (auto & sig : rm.signatures())
-                        realisation.signatures.insert(Signature::parse(sig));
-                    success.builtOutputs.insert_or_assign(outputName, realisation);
-                }
-                br.inner = std::move(success);
-            } else
-                br.inner = BuildError(BuildResultFailureStatus::MiscFailure, "%s", pr.error());
-            result = std::move(br);
-        }
-        auto s = reader->Finish();
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            result.reset();
+            auto reader = stub.BuildDerivation(&ctx, req);
+            pb::BuildEvent ev;
+            while (reader->Read(&ev)) {
+                if (!ev.has_result())
+                    continue; // TODO: forward log/activity events
+                auto & pr = ev.result();
+                BuildResult br;
+                if (pr.success()) {
+                    BuildResult::Success success;
+                    success.status = BuildResult::Success::Built;
+                    for (auto & [outputName, rm] : pr.built_outputs()) {
+                        UnkeyedRealisation realisation{.outPath = parseStorePath(rm.out_path())};
+                        for (auto & sig : rm.signatures())
+                            realisation.signatures.insert(Signature::parse(sig));
+                        success.builtOutputs.insert_or_assign(outputName, realisation);
+                    }
+                    br.inner = std::move(success);
+                } else
+                    br.inner = BuildError(BuildResultFailureStatus::MiscFailure, "%s", pr.error());
+                result = std::move(br);
+            }
+            return reader->Finish();
+        });
         if (!result)
             throw Error("no build result returned from the remote gRPC store");
         return *result;
@@ -366,13 +446,13 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     Roots findRoots(bool censor) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::Empty req;
         pb::RootsReply resp;
-        auto s = stub->FindRoots(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.FindRoots(&ctx, req, &resp);
+        });
         Roots roots;
         for (auto & [path, links] : resp.roots()) {
             auto & set = roots[parseStorePath(path)];
@@ -384,8 +464,6 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     void collectGarbage(const GCOptions & options, GCResults & results) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::GCRequest req;
         if (options.action == GCOptions::gcReturnLive)
             req.set_action(pb::GCRequest::RETURN_LIVE);
@@ -401,9 +479,11 @@ struct GrpcStore : virtual Store, virtual GcStore
         if (options.maxFreed != std::numeric_limits<uint64_t>::max())
             req.set_max_freed(options.maxFreed);
         pb::GCReply resp;
-        auto s = stub->CollectGarbage(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.CollectGarbage(&ctx, req, &resp);
+        });
         for (auto & p : resp.paths())
             results.paths.insert(p);
         results.bytesFreed = resp.bytes_freed();
@@ -418,11 +498,6 @@ struct GrpcStore : virtual Store, virtual GcStore
         const StorePathSet & references,
         RepairFlag repair) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
-        pb::OptionalStorePathReply resp;
-        auto writer = stub->AddToStoreFromDump(&ctx, &resp);
-
         pb::AddDumpChunk head;
         auto * h = head.mutable_header();
         h->set_name(std::string(name));
@@ -431,19 +506,27 @@ struct GrpcStore : virtual Store, virtual GcStore
         for (auto & r : references)
             h->add_references(printStorePath(r));
         h->set_repair(repair == Repair);
-        if (!writer->Write(head))
-            throw Error("gRPC AddToStoreFromDump: failed to send header");
 
-        ChunkSink<grpc::ClientWriter<pb::AddDumpChunk>, pb::AddDumpChunk> sink(*writer, [](std::string_view d) {
-            pb::AddDumpChunk c;
-            c.set_dump(std::string(d));
-            return c;
-        });
-        dump.drainInto(sink);
-        writer->WritesDone();
-        auto s = writer->Finish();
-        if (!s.ok())
-            fail(s);
+        pb::OptionalStorePathReply resp;
+        bool started = false; // once the dump is being drained we cannot retry
+        withFailover(
+            [&](pb::NixStore::Stub & stub) -> grpc::Status {
+                grpc::ClientContext ctx;
+                auth(ctx);
+                auto writer = stub.AddToStoreFromDump(&ctx, &resp);
+                if (!writer->Write(head))
+                    return writer->Finish();
+                started = true;
+                ChunkSink<grpc::ClientWriter<pb::AddDumpChunk>, pb::AddDumpChunk> sink(*writer, [](std::string_view d) {
+                    pb::AddDumpChunk c;
+                    c.set_dump(std::string(d));
+                    return c;
+                });
+                dump.drainInto(sink);
+                writer->WritesDone();
+                return writer->Finish();
+            },
+            [&]() { return !started; });
         if (!resp.has_path())
             throw Error("gRPC AddToStoreFromDump: no store path returned");
         return parseStorePath(resp.path());
@@ -451,15 +534,15 @@ struct GrpcStore : virtual Store, virtual GcStore
 
     MissingPaths queryMissing(const std::vector<DerivedPath> & targets) override
     {
-        grpc::ClientContext ctx;
-        auth(ctx);
         pb::StorePathsRequest req;
         for (auto & t : targets)
             req.add_paths(t.to_string(*this));
         pb::QueryMissingReply resp;
-        auto s = stub->QueryMissing(&ctx, req, &resp);
-        if (!s.ok())
-            fail(s);
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.QueryMissing(&ctx, req, &resp);
+        });
         MissingPaths missing;
         for (auto & p : resp.will_build())
             missing.willBuild.insert(parseStorePath(p));
@@ -488,7 +571,9 @@ struct GrpcStore : virtual Store, virtual GcStore
     }
 
 private:
-    std::unique_ptr<pb::NixStore::Stub> stub;
+    std::vector<std::string> targets;
+    std::vector<std::unique_ptr<pb::NixStore::Stub>> stubs;
+    std::atomic<size_t> currentNode{0};
 };
 
 } // namespace grpc_transport

@@ -122,8 +122,11 @@ See `smoke-test.sh` to reproduce.
       (the last via a `RemoteFSAccessor` over `NarFromPath`). Add-file and
       `store cat` over `grpc://` runtime-validated. The store interface is now
       essentially complete over gRPC.
-- [ ] Build-log/progress forwarding over the `BuildEvent` stream; client
-      connection pooling/reconnect; gRPC ↔ status error-mapping refinements.
+- [x] Client-side cluster failover: `grpc://host?nodes=h1:p,h2:p,…` retries
+      each operation on the next node when one is unreachable. Runtime-validated
+      (kill a node mid-use; queries, copies, and GC fail over to a live node).
+- [ ] Build-log/progress forwarding over the `BuildEvent` stream; gRPC ↔ status
+      error-mapping refinements; dynamic node discovery (DNS / coordinator).
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket

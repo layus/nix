@@ -102,9 +102,16 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       method/algo carried as a `renderWithAlgo` string); `getFSAccessor` (a
       `RemoteFSAccessor` over `NarFromPath`). The store surface is now
       essentially complete over gRPC.
+- [x] Client-side cluster failover. The `grpc://` store takes a `nodes`
+      parameter (comma-separated `host:port`); every operation is wrapped in a
+      `withFailover` helper that, on a transport failure (`UNAVAILABLE`/
+      `DEADLINE_EXCEEDED`), advances to the next node and retries. A genuine
+      operation error is not retried (it would fail the same everywhere).
+      Unary ops and builds/GC retry fully; streamed uploads/downloads fail over
+      only before the un-replayable stream starts (a `canRetry` guard).
 - [ ] Forwarding build logs/progress through the `BuildEvent` stream
-      (result-only for now); connection pooling/reconnect on the client; map
-      errors ↔ gRPC status codes; deadlines/retries for idempotent RPCs.
+      (result-only for now); map errors ↔ gRPC status codes; node-discovery
+      beyond a static list (DNS / coordinator).
 
 ## How it composes with the rest
 
