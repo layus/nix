@@ -9,6 +9,8 @@
 #  include "nix/store/local-fs-store.hh"
 #  include "nix/store/derived-path.hh"
 #  include "nix/store/derivations.hh"
+#  include "nix/store/content-address.hh"
+#  include "nix/util/file-content-address.hh"
 
 #  include "nix-store.grpc.pb.h"
 
@@ -297,6 +299,52 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                 r->set_error(failure->msg());
             }
             writer->Write(ev);
+        });
+    }
+
+    Status QueryMissing(ServerContext * ctx, const pb::StorePathsRequest * req, pb::QueryMissingReply * resp) override
+    {
+        if (auto s = checkAuth(*ctx, token); !s.ok())
+            return s;
+        return guarded([&]() {
+            std::vector<DerivedPath> targets;
+            for (auto & s : req->paths())
+                targets.push_back(DerivedPath::parse(*store, s));
+            auto missing = store->queryMissing(targets);
+            for (auto & p : missing.willBuild)
+                resp->add_will_build(store->printStorePath(p));
+            for (auto & p : missing.willSubstitute)
+                resp->add_will_substitute(store->printStorePath(p));
+            for (auto & p : missing.unknown)
+                resp->add_unknown(store->printStorePath(p));
+            resp->set_download_size(missing.downloadSize);
+            resp->set_nar_size(missing.narSize);
+        });
+    }
+
+    Status AddToStoreFromDump(
+        ServerContext * ctx, grpc::ServerReader<pb::AddDumpChunk> * reader, pb::OptionalStorePathReply * resp) override
+    {
+        if (auto s = checkAuth(*ctx, token); !s.ok())
+            return s;
+        return guarded([&]() {
+            pb::AddDumpChunk first;
+            if (!reader->Read(&first) || !first.has_header())
+                throw Error("gRPC AddToStoreFromDump: missing leading header message");
+            auto & h = first.header();
+
+            auto dumpMethod = parseFileSerialisationMethod(h.dump_method());
+            auto [hashMethod, hashAlgo] = ContentAddressMethod::parseWithAlgo(h.ca_method_with_algo());
+            StorePathSet references;
+            for (auto & r : h.references())
+                references.insert(store->parseStorePath(r));
+
+            ChunkSource<grpc::ServerReader<pb::AddDumpChunk>, pb::AddDumpChunk> source(
+                *reader, [](const pb::AddDumpChunk & c) -> const std::string & { return c.dump(); });
+
+            auto path = store->addToStoreFromDump(
+                source, h.name(), dumpMethod, hashMethod, hashAlgo, references, h.repair() ? Repair : NoRepair);
+            resp->set_path(store->printStorePath(path));
         });
     }
 };

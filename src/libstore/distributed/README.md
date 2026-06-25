@@ -118,9 +118,12 @@ See `smoke-test.sh` to reproduce.
       the distributed store (garbage collected, rooted/temp-rooted paths kept).
 - [x] `BuildDerivation` over gRPC, with the derivation sent as a JSON blob
       (Nix's standard `BasicDerivation` JSON format).
-- [ ] Still unbridged over gRPC: `QueryMissing`, `addToStoreFromDump`,
-      `getFSAccessor`; build-log forwarding; gRPC ↔ status error-mapping
-      refinements.
+- [x] `QueryMissing`, `addToStoreFromDump`, and `getFSAccessor` over gRPC
+      (the last via a `RemoteFSAccessor` over `NarFromPath`). Add-file and
+      `store cat` over `grpc://` runtime-validated. The store interface is now
+      essentially complete over gRPC.
+- [ ] Build-log/progress forwarding over the `BuildEvent` stream; client
+      connection pooling/reconnect; gRPC ↔ status error-mapping refinements.
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket

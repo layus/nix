@@ -33,6 +33,9 @@ service NixStore {
   // --- Bulk content transfer (streamed) ---
   // First message carries the ValidPathInfo; subsequent messages carry NAR bytes.
   rpc AddToStore(stream AddToStoreChunk) returns (PathInfoReply);
+  // First message carries the header; subsequent messages carry dump bytes.
+  // Returns the resulting (content-addressed) store path.
+  rpc AddToStoreFromDump(stream AddDumpChunk) returns (OptionalStorePathReply);
   // Server streams NAR bytes for the path.
   rpc NarFromPath(StorePathRequest) returns (stream NarChunk);
 
@@ -85,6 +88,20 @@ message AddToStoreChunk {
   }
 }
 message NarChunk { bytes nar = 1; }
+
+message AddDumpChunk {
+  oneof kind {
+    AddDumpHeader header = 1; // exactly one, first
+    bytes dump           = 2; // zero or more, in order
+  }
+}
+message AddDumpHeader {
+  string name                = 1;
+  string dump_method         = 2; // file serialisation method, e.g. "nar"/"flat"
+  string ca_method_with_algo = 3; // content-address method + hash algo, e.g. "nar:sha256"
+  repeated string references = 4;
+  bool repair                = 5;
+}
 
 message Realisation {
   string drv_output = 1; // "<drvhash>!<output>"

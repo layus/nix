@@ -98,10 +98,13 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       standard `BasicDerivation` `adl_serializer` on both ends. The result
       (success + built outputs, or the error) comes back on the `BuildEvent`
       stream.
-- [ ] `QueryMissing`, `addToStoreFromDump`, `getFSAccessor`; forwarding build
-      logs/progress through the `BuildEvent` stream (result-only for now).
-- [ ] Connection pooling/reconnect on the client; map errors ↔ gRPC status
-      codes; deadlines/retries for idempotent RPCs.
+- [x] `QueryMissing`; `AddToStoreFromDump` (header + streamed dump, content
+      method/algo carried as a `renderWithAlgo` string); `getFSAccessor` (a
+      `RemoteFSAccessor` over `NarFromPath`). The store surface is now
+      essentially complete over gRPC.
+- [ ] Forwarding build logs/progress through the `BuildEvent` stream
+      (result-only for now); connection pooling/reconnect on the client; map
+      errors ↔ gRPC status codes; deadlines/retries for idempotent RPCs.
 
 ## How it composes with the rest
 

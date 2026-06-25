@@ -7,6 +7,9 @@
 #  include "nix/store/gc-store.hh"
 #  include "nix/store/derived-path.hh"
 #  include "nix/store/derivations.hh"
+#  include "nix/store/content-address.hh"
+#  include "nix/store/remote-fs-accessor.hh"
+#  include "nix/util/file-content-address.hh"
 #  include "nix/util/callback.hh"
 
 #  include "nix-store.grpc.pb.h"
@@ -406,22 +409,77 @@ struct GrpcStore : virtual Store, virtual GcStore
         results.bytesFreed = resp.bytes_freed();
     }
 
-    /* --- not yet bridged over gRPC --- */
     StorePath addToStoreFromDump(
-        Source &, std::string_view, FileSerialisationMethod, ContentAddressMethod, HashAlgorithm, const StorePathSet &,
-        RepairFlag) override
+        Source & dump,
+        std::string_view name,
+        FileSerialisationMethod dumpMethod,
+        ContentAddressMethod hashMethod,
+        HashAlgorithm hashAlgo,
+        const StorePathSet & references,
+        RepairFlag repair) override
     {
-        throw Error("'addToStoreFromDump' is not yet supported over the gRPC store");
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::OptionalStorePathReply resp;
+        auto writer = stub->AddToStoreFromDump(&ctx, &resp);
+
+        pb::AddDumpChunk head;
+        auto * h = head.mutable_header();
+        h->set_name(std::string(name));
+        h->set_dump_method(std::string(renderFileSerialisationMethod(dumpMethod)));
+        h->set_ca_method_with_algo(hashMethod.renderWithAlgo(hashAlgo));
+        for (auto & r : references)
+            h->add_references(printStorePath(r));
+        h->set_repair(repair == Repair);
+        if (!writer->Write(head))
+            throw Error("gRPC AddToStoreFromDump: failed to send header");
+
+        ChunkSink<grpc::ClientWriter<pb::AddDumpChunk>, pb::AddDumpChunk> sink(*writer, [](std::string_view d) {
+            pb::AddDumpChunk c;
+            c.set_dump(std::string(d));
+            return c;
+        });
+        dump.drainInto(sink);
+        writer->WritesDone();
+        auto s = writer->Finish();
+        if (!s.ok())
+            fail(s);
+        if (!resp.has_path())
+            throw Error("gRPC AddToStoreFromDump: no store path returned");
+        return parseStorePath(resp.path());
     }
 
-    ref<SourceAccessor> getFSAccessor(bool) override
+    MissingPaths queryMissing(const std::vector<DerivedPath> & targets) override
     {
-        throw Error("'getFSAccessor' is not yet supported over the gRPC store");
+        grpc::ClientContext ctx;
+        auth(ctx);
+        pb::StorePathsRequest req;
+        for (auto & t : targets)
+            req.add_paths(t.to_string(*this));
+        pb::QueryMissingReply resp;
+        auto s = stub->QueryMissing(&ctx, req, &resp);
+        if (!s.ok())
+            fail(s);
+        MissingPaths missing;
+        for (auto & p : resp.will_build())
+            missing.willBuild.insert(parseStorePath(p));
+        for (auto & p : resp.will_substitute())
+            missing.willSubstitute.insert(parseStorePath(p));
+        for (auto & p : resp.unknown())
+            missing.unknown.insert(parseStorePath(p));
+        missing.downloadSize = resp.download_size();
+        missing.narSize = resp.nar_size();
+        return missing;
     }
 
-    std::shared_ptr<SourceAccessor> getFSAccessor(const StorePath &, bool) override
+    ref<SourceAccessor> getFSAccessor(bool requireValidPath) override
     {
-        throw Error("'getFSAccessor' is not yet supported over the gRPC store");
+        return make_ref<RemoteFSAccessor>(ref<Store>(shared_from_this()), requireValidPath);
+    }
+
+    std::shared_ptr<SourceAccessor> getFSAccessor(const StorePath & path, bool requireValidPath) override
+    {
+        return make_ref<RemoteFSAccessor>(ref<Store>(shared_from_this()), requireValidPath)->accessObject(path);
     }
 
     std::optional<TrustedFlag> isTrustedClient() override
