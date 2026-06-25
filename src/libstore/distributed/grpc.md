@@ -113,9 +113,15 @@ Add an optional `grpc` meson feature (mirroring the `postgres` feature):
       replay the buffer on each attempt; downloads (`narFromPath`) buffer the
       whole NAR and only write the caller's sink after a fully successful
       fetch. Unary ops and builds/GC re-run directly.
-- [ ] Forwarding build logs/progress through the `BuildEvent` stream
-      (result-only for now); map errors ↔ gRPC status codes; node-discovery
-      beyond a static list (DNS / coordinator).
+- [x] Build-log streaming. During `BuildPaths`/`BuildDerivation` the server
+      installs a `GrpcLogger` as the global logger (serialised by a build
+      mutex) that forwards log lines, build output (`resBuildLogLine`), and
+      activity text as `BuildEvent` `log_line`s; the client replays them
+      through its local logger, so `nix ... -L` shows the remote build output.
+      Runtime-validated: a build's stdout streamed back over gRPC.
+- [ ] Map errors ↔ gRPC status codes; richer activity/progress forwarding;
+      `buildPathsWithResults` forwarding (so `nix build --store grpc://` works,
+      not just `nix-store --realise`); node-discovery beyond a static list.
 
 ## How it composes with the rest
 

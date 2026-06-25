@@ -4,6 +4,8 @@
 
 #  include "grpc-common.hh"
 #  include "nix/util/logging.hh"
+#  include "nix/util/error.hh"
+#  include "nix/util/finally.hh"
 #  include "nix/store/store-cast.hh"
 #  include "nix/store/gc-store.hh"
 #  include "nix/store/local-fs-store.hh"
@@ -16,6 +18,9 @@
 
 #  include <nlohmann/json.hpp>
 
+#  include <mutex>
+#  include <sstream>
+
 #  include <grpcpp/grpcpp.h>
 #  include <grpcpp/server_builder.h>
 
@@ -26,6 +31,58 @@ namespace {
 using grpc::ServerContext;
 using grpc::Status;
 using grpc::StatusCode;
+
+/* A Logger that forwards build output and progress to the client as
+   `BuildEvent` log lines. Installed as the global logger for the duration of a
+   build; its writes are serialised against the build thread / activity
+   callbacks. */
+struct GrpcLogger : Logger
+{
+    grpc::ServerWriter<pb::BuildEvent> * writer;
+    std::mutex mutex;
+
+    GrpcLogger(grpc::ServerWriter<pb::BuildEvent> * writer)
+        : writer(writer)
+    {
+    }
+
+    void emit(const std::string & line)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        pb::BuildEvent ev;
+        ev.set_log_line(line);
+        writer->Write(ev);
+    }
+
+    void log(Verbosity lvl, std::string_view s) override
+    {
+        if (lvl <= verbosity)
+            emit(std::string(s));
+    }
+
+    void logEI(const ErrorInfo & ei) override
+    {
+        if (ei.level > verbosity)
+            return;
+        std::ostringstream oss;
+        showErrorInfo(oss, ei, false);
+        emit(oss.str());
+    }
+
+    void result(ActivityId, ResultType type, const Fields & fields) override
+    {
+        if ((type == resBuildLogLine || type == resPostBuildLogLine) && !fields.empty()
+            && fields[0].type == Logger::Field::tString)
+            emit(fields[0].s);
+    }
+
+    void startActivity(
+        ActivityId, Verbosity lvl, ActivityType, const std::string & s, const Fields &, ActivityId) override
+    {
+        if (lvl <= verbosity && !s.empty())
+            emit(s);
+    }
+};
 
 /* Run `body`, translating Nix exceptions into a gRPC error status. */
 template<typename F>
@@ -45,6 +102,10 @@ struct NixStoreServiceImpl : pb::NixStore::Service
 {
     ref<Store> store;
     std::string token;
+
+    /* Serialises builds so that only one build's forwarding logger is the
+       global logger at a time (the logger is process-global). */
+    std::mutex buildMutex;
 
     NixStoreServiceImpl(ref<Store> store, std::string token)
         : store(store)
@@ -256,13 +317,21 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                 paths.push_back(DerivedPath::parse(*store, s));
 
             pb::BuildEvent ev;
-            try {
-                store->buildPaths(paths, fromProto(req->mode()));
-                ev.mutable_result()->set_success(true);
-            } catch (Error & e) {
-                auto * r = ev.mutable_result();
-                r->set_success(false);
-                r->set_error(e.msg());
+            {
+                /* Forward the build's logs/progress to the client while it runs. */
+                std::lock_guard<std::mutex> buildLock(buildMutex);
+                GrpcLogger grpcLogger(writer);
+                auto * prevLogger = logger;
+                logger = &grpcLogger;
+                Finally restoreLogger([&]() { logger = prevLogger; });
+                try {
+                    store->buildPaths(paths, fromProto(req->mode()));
+                    ev.mutable_result()->set_success(true);
+                } catch (Error & e) {
+                    auto * r = ev.mutable_result();
+                    r->set_success(false);
+                    r->set_error(e.msg());
+                }
             }
             writer->Write(ev);
         });
@@ -281,7 +350,15 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                parsed with the same `adl_serializer` on both ends. */
             BasicDerivation drv = static_cast<BasicDerivation>(nlohmann::json::parse(req->drv()));
 
-            auto result = store->buildDerivation(drvPath, drv, fromProto(req->mode()));
+            BuildResult result;
+            {
+                std::lock_guard<std::mutex> buildLock(buildMutex);
+                GrpcLogger grpcLogger(writer);
+                auto * prevLogger = logger;
+                logger = &grpcLogger;
+                Finally restoreLogger([&]() { logger = prevLogger; });
+                result = store->buildDerivation(drvPath, drv, fromProto(req->mode()));
+            }
 
             pb::BuildEvent ev;
             auto * r = ev.mutable_result();

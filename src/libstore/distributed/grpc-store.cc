@@ -14,6 +14,7 @@
 #  include "nix/util/serialise.hh"
 #  include "nix/util/callback.hh"
 #  include "nix/util/strings.hh"
+#  include "nix/util/logging.hh"
 
 #  include "nix-store.grpc.pb.h"
 
@@ -365,7 +366,7 @@ struct GrpcStore : virtual Store, virtual GcStore
     {
         try {
             pb::DrvOutputRequest req;
-            req.set_drv_output(id.to_string());
+            req.set_drv_output(id.render(*this));
             pb::OptionalRealisationReply resp;
             withFailover([&](pb::NixStore::Stub & stub) {
                 grpc::ClientContext ctx;
@@ -413,11 +414,12 @@ struct GrpcStore : virtual Store, virtual GcStore
             auto reader = stub.BuildPaths(&ctx, req);
             pb::BuildEvent ev;
             while (reader->Read(&ev)) {
-                if (ev.has_result()) {
+                if (ev.has_log_line())
+                    logger->log(lvlInfo, ev.log_line());
+                else if (ev.has_result()) {
                     ok = ev.result().success();
                     err = ev.result().error();
                 }
-                // TODO: forward ev.log_line()/ev.activity() to the local logger.
             }
             return reader->Finish();
         });
@@ -442,8 +444,12 @@ struct GrpcStore : virtual Store, virtual GcStore
             auto reader = stub.BuildDerivation(&ctx, req);
             pb::BuildEvent ev;
             while (reader->Read(&ev)) {
+                if (ev.has_log_line()) {
+                    logger->log(lvlInfo, ev.log_line());
+                    continue;
+                }
                 if (!ev.has_result())
-                    continue; // TODO: forward log/activity events
+                    continue;
                 auto & pr = ev.result();
                 BuildResult br;
                 if (pr.success()) {

@@ -81,7 +81,7 @@ inline ValidPathInfo fromProto(const StoreDirConfig & store, const pb::PathInfo 
 /** Fill a proto `Realisation` from `id` + an (unkeyed) realisation. */
 inline void toProto(const StoreDirConfig & store, const DrvOutput & id, const UnkeyedRealisation & r, pb::Realisation & out)
 {
-    out.set_drv_output(id.to_string());
+    out.set_drv_output(id.render(store));
     out.set_out_path(store.printStorePath(r.outPath));
     for (auto & sig : r.signatures)
         out.add_signatures(sig.to_string());
