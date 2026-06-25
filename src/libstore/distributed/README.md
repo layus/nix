@@ -122,9 +122,13 @@ See `smoke-test.sh` to reproduce.
       (the last via a `RemoteFSAccessor` over `NarFromPath`). Add-file and
       `store cat` over `grpc://` runtime-validated. The store interface is now
       essentially complete over gRPC.
-- [x] Client-side cluster failover: `grpc://host?nodes=h1:p,h2:p,…` retries
-      each operation on the next node when one is unreachable. Runtime-validated
-      (kill a node mid-use; queries, copies, and GC fail over to a live node).
+- [x] Client-side cluster failover, **no node failure fatal**:
+      `grpc://host?nodes=h1:p,h2:p,…` restarts each operation from scratch on
+      the next node when one is unreachable. Streaming ops buffer their payload
+      (uploads replay it; downloads buffer the NAR and write the sink only on
+      success) so even a mid-stream node death just restarts elsewhere.
+      Runtime-validated (kill a node; queries, copies to/from, add-file, cat,
+      and GC all fail over to a live node).
 - [ ] Build-log/progress forwarding over the `BuildEvent` stream; gRPC ↔ status
       error-mapping refinements; dynamic node discovery (DNS / coordinator).
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind

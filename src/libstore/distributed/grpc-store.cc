@@ -10,6 +10,8 @@
 #  include "nix/store/content-address.hh"
 #  include "nix/store/remote-fs-accessor.hh"
 #  include "nix/util/file-content-address.hh"
+#  include "nix/util/file-system.hh"
+#  include "nix/util/serialise.hh"
 #  include "nix/util/callback.hh"
 #  include "nix/util/strings.hh"
 
@@ -19,7 +21,9 @@
 #  include <nlohmann/json.hpp>
 
 #  include <atomic>
+#  include <fcntl.h>
 #  include <limits>
+#  include <unistd.h>
 #  include <vector>
 
 namespace nix {
@@ -79,6 +83,31 @@ private:
 
 namespace grpc_transport {
 
+/* Buffers a Source to a temp file so the bytes can be replayed (re-read from
+   the start) for each failover attempt. */
+struct TempBuffer
+{
+    std::pair<AutoCloseFD, std::filesystem::path> tmp;
+    AutoDelete del;
+
+    TempBuffer(Source & source)
+        : tmp(createTempFile("nix-grpc-upload"))
+        , del(tmp.second)
+    {
+        FdSink sink(tmp.first.get());
+        source.drainInto(sink);
+        sink.flush();
+    }
+
+    /* A fresh Source reading from the start of the buffer. */
+    FdSource replay()
+    {
+        if (lseek(tmp.first.get(), 0, SEEK_SET) == (off_t) -1)
+            throw SysError("rewinding gRPC upload buffer");
+        return FdSource(tmp.first.get());
+    }
+};
+
 struct GrpcStore : virtual Store, virtual GcStore
 {
     using Config = GrpcStoreConfig;
@@ -128,14 +157,15 @@ struct GrpcStore : virtual Store, virtual GcStore
     }
 
     /* Run `fn` against the cluster, starting at the last good node and
-       advancing to the next whenever a node is unreachable. A genuine
-       operation error is thrown immediately (it would fail the same on every
-       node). `canRetry()` is consulted before failing over: it returns false
-       once an operation has consumed un-replayable input/output (a streamed
-       NAR), in which case a mid-stream node failure is fatal. Throws if every
-       node is unreachable. */
-    template<typename Fn, typename CanRetry>
-    void withFailover(Fn fn, CanRetry canRetry)
+       advancing to the next whenever a node is unreachable, cycling through
+       every node before giving up. A genuine operation error is thrown
+       immediately (it would fail the same on every node). `fn` MUST be safe to
+       run from scratch more than once: unary calls and builds are naturally
+       so, and the streaming operations buffer their payload (see below) so
+       they too can simply restart on another node. Throws only once every node
+       has been tried and found unreachable. */
+    template<typename Fn>
+    void withFailover(Fn fn)
     {
         size_t n = stubs.size();
         size_t start = currentNode.load();
@@ -150,17 +180,9 @@ struct GrpcStore : virtual Store, virtual GcStore
             if (!isNodeFailure(s))
                 fail(s);
             lastError = fmt("node '%s': %s", targets[idx], s.error_message());
-            if (!canRetry())
-                throw Error("gRPC node '%s' failed mid-operation and cannot be retried: %s", targets[idx], s.error_message());
             debug("gRPC store: %s; trying next node", lastError);
         }
         throw Error("all %d gRPC cluster nodes are unreachable (last: %s)", n, lastError);
-    }
-
-    template<typename Fn>
-    void withFailover(Fn fn)
-    {
-        withFailover(std::move(fn), []() { return true; });
     }
 
     bool isValidPathUncached(const StorePath & path) override
@@ -234,51 +256,52 @@ struct GrpcStore : virtual Store, virtual GcStore
     {
         pb::AddToStoreChunk head;
         toProto(*this, info, *head.mutable_info());
-        /* Once we start draining `source` it cannot be replayed, so we may only
-           fail over to another node before the first NAR byte is sent. */
-        bool started = false;
-        withFailover(
-            [&](pb::NixStore::Stub & stub) -> grpc::Status {
-                grpc::ClientContext ctx;
-                auth(ctx);
-                pb::PathInfoReply resp;
-                auto writer = stub.AddToStore(&ctx, &resp);
-                if (!writer->Write(head))
-                    return writer->Finish(); // header send failed; source untouched
-                started = true;
-                ChunkSink<grpc::ClientWriter<pb::AddToStoreChunk>, pb::AddToStoreChunk> sink(
-                    *writer, [](std::string_view d) {
-                        pb::AddToStoreChunk c;
-                        c.set_nar(std::string(d));
-                        return c;
-                    });
-                source.drainInto(sink);
-                writer->WritesDone();
+        /* Buffer the NAR so the upload can be replayed verbatim on any node. */
+        TempBuffer buffer(source);
+        withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            pb::PathInfoReply resp;
+            auto writer = stub.AddToStore(&ctx, &resp);
+            if (!writer->Write(head))
                 return writer->Finish();
-            },
-            [&]() { return !started; });
+            ChunkSink<grpc::ClientWriter<pb::AddToStoreChunk>, pb::AddToStoreChunk> sink(*writer, [](std::string_view d) {
+                pb::AddToStoreChunk c;
+                c.set_nar(std::string(d));
+                return c;
+            });
+            buffer.replay().drainInto(sink);
+            writer->WritesDone();
+            return writer->Finish();
+        });
     }
 
     void narFromPath(const StorePath & path, Sink & sink) override
     {
         pb::StorePathRequest req;
         req.set_path(printStorePath(path));
-        /* Once we have written a byte to `sink` we cannot restart, so fail over
-           only before the first chunk arrives. */
-        bool wrote = false;
-        withFailover(
-            [&](pb::NixStore::Stub & stub) -> grpc::Status {
-                grpc::ClientContext ctx;
-                auth(ctx);
-                auto reader = stub.NarFromPath(&ctx, req);
-                pb::NarChunk chunk;
-                while (reader->Read(&chunk)) {
-                    wrote = true;
-                    sink(chunk.nar());
-                }
-                return reader->Finish();
-            },
-            [&]() { return !wrote; });
+        /* Fetch the whole NAR into a temp file; only on a fully successful
+           fetch do we write it to `sink`, so a mid-stream node failure just
+           discards the buffer and restarts on another node. */
+        auto [fd, tmpPath] = createTempFile("nix-grpc-nar");
+        AutoDelete del(tmpPath);
+        withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            if (ftruncate(fd.get(), 0) != 0 || lseek(fd.get(), 0, SEEK_SET) == (off_t) -1)
+                throw SysError("resetting gRPC NAR buffer");
+            FdSink fileSink(fd.get());
+            auto reader = stub.NarFromPath(&ctx, req);
+            pb::NarChunk chunk;
+            while (reader->Read(&chunk))
+                fileSink(chunk.nar());
+            fileSink.flush();
+            return reader->Finish();
+        });
+        if (lseek(fd.get(), 0, SEEK_SET) == (off_t) -1)
+            throw SysError("rewinding gRPC NAR buffer");
+        FdSource fileSource(fd.get());
+        fileSource.drainInto(sink);
     }
 
     void queryReferrers(const StorePath & path, StorePathSet & referrers) override
@@ -507,26 +530,24 @@ struct GrpcStore : virtual Store, virtual GcStore
             h->add_references(printStorePath(r));
         h->set_repair(repair == Repair);
 
+        /* Buffer the dump so it can be replayed on any node. */
+        TempBuffer buffer(dump);
         pb::OptionalStorePathReply resp;
-        bool started = false; // once the dump is being drained we cannot retry
-        withFailover(
-            [&](pb::NixStore::Stub & stub) -> grpc::Status {
-                grpc::ClientContext ctx;
-                auth(ctx);
-                auto writer = stub.AddToStoreFromDump(&ctx, &resp);
-                if (!writer->Write(head))
-                    return writer->Finish();
-                started = true;
-                ChunkSink<grpc::ClientWriter<pb::AddDumpChunk>, pb::AddDumpChunk> sink(*writer, [](std::string_view d) {
-                    pb::AddDumpChunk c;
-                    c.set_dump(std::string(d));
-                    return c;
-                });
-                dump.drainInto(sink);
-                writer->WritesDone();
+        withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            auto writer = stub.AddToStoreFromDump(&ctx, &resp);
+            if (!writer->Write(head))
                 return writer->Finish();
-            },
-            [&]() { return !started; });
+            ChunkSink<grpc::ClientWriter<pb::AddDumpChunk>, pb::AddDumpChunk> sink(*writer, [](std::string_view d) {
+                pb::AddDumpChunk c;
+                c.set_dump(std::string(d));
+                return c;
+            });
+            buffer.replay().drainInto(sink);
+            writer->WritesDone();
+            return writer->Finish();
+        });
         if (!resp.has_path())
             throw Error("gRPC AddToStoreFromDump: no store path returned");
         return parseStorePath(resp.path());
