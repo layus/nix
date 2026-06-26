@@ -85,13 +85,15 @@ private:
         StorePathSet inputPaths,
         std::map<std::string, InitialOutput> initialOutputs,
         DerivationOptions<StorePath> drvOptions,
-        PathLocks outputLocks);
+        PathLocks outputLocks,
+        std::unique_ptr<BuildLock> buildLock);
     Co buildLocally(
         LocalBuildCapability localBuildCap,
         StorePathSet inputPaths,
         std::map<std::string, InitialOutput> initialOutputs,
         DerivationOptions<StorePath> drvOptions,
-        PathLocks outputLocks);
+        PathLocks outputLocks,
+        std::unique_ptr<BuildLock> buildLock);
 
     /**
      * Is the build hook willing to perform the build?

@@ -5,6 +5,7 @@
 #  include "nix/store/distributed-store.hh"
 #  include "nix/store/postgres-metadata-backend.hh"
 #  include "nix/store/store-registration.hh"
+#  include "nix/store/derivations.hh"
 #  include "nix/store/pathlocks.hh"
 #  include "nix/store/posix-fs-canonicalise.hh"
 #  include "nix/util/callback.hh"
@@ -26,6 +27,41 @@ namespace nix {
    never lapses while its node is alive. */
 static constexpr uint64_t tempRootTtlSeconds = 600;
 static constexpr unsigned tempRootHeartbeatSeconds = 200;
+
+/* How long a per-derivation build lock stays valid without a heartbeat; the
+   same heartbeat that renews temp roots renews held build locks, so a build
+   longer than this never loses its lock, while a crashed builder's lock lapses. */
+static constexpr uint64_t buildLockTtlSeconds = 600;
+
+namespace {
+
+/* RAII handle for a held cluster-wide build lock; releases it on destruction.
+   Holds a raw backend pointer, which is safe because the owning DistributedStore
+   (and thus the backend) outlives any build it is running. */
+struct DistributedBuildLock : BuildLock
+{
+    MetadataBackend * backend;
+    std::string drvPath;
+    std::string holder;
+
+    DistributedBuildLock(MetadataBackend * backend, std::string drvPath, std::string holder)
+        : backend(backend)
+        , drvPath(std::move(drvPath))
+        , holder(std::move(holder))
+    {
+    }
+
+    ~DistributedBuildLock() override
+    {
+        try {
+            backend->releaseBuildLock(drvPath, holder);
+        } catch (...) {
+            ignoreExceptionInDestructor();
+        }
+    }
+};
+
+} // namespace
 
 /* ------------------------------------------------------------------ *
  * Config
@@ -67,7 +103,7 @@ StoreReference DistributedStoreConfig::getReference() const
 
 ref<Store> DistributedStoreConfig::openStore() const
 {
-    return make_ref<DistributedStore>(ref<const DistributedStoreConfig>(shared_from_this()));
+    return make_ref<DistributedStore>(ref{std::dynamic_pointer_cast<const DistributedStoreConfig>(shared_from_this())});
 }
 
 /* ------------------------------------------------------------------ *
@@ -77,6 +113,7 @@ ref<Store> DistributedStoreConfig::openStore() const
 DistributedStore::DistributedStore(ref<const Config> config)
     : Store{*config}
     , LocalFSStore{*config}
+    , LocalStore{static_cast<ref<const LocalStore::Config>>(config)}
     , config{config}
 {
     if (config->metadataDbUrl.get().empty())
@@ -100,6 +137,7 @@ DistributedStore::DistributedStore(ref<const Config> config)
             lk.unlock();
             try {
                 backend->renewTempRoots(nodeId, tempRootTtlSeconds);
+                backend->renewBuildLocks(nodeId, buildLockTtlSeconds);
             } catch (...) {
                 /* Don't let a transient database error kill the heartbeat. */
             }
@@ -174,6 +212,31 @@ void DistributedStore::registerDrvOutput(const Realisation & info)
     backend->registerDrvOutput(info);
 }
 
+void DistributedStore::registerValidPaths(const ValidPathInfos & infos)
+{
+    /* The build pipeline registers its outputs here (LocalStore would write
+       SQLite); route to the shared database so every node sees them. */
+    backend->registerValidPaths(infos);
+
+    /* Mirror LocalStore::addValidPath: when a derivation is registered, record
+       its output map (output name -> output path). The build relies on this
+       (via queryDerivationOutputMap), so it must be populated for every .drv
+       added to the store. Parsing requires the derivation content, which is on
+       the shared filesystem, so we do it at the store layer. */
+    for (auto & [_, info] : infos) {
+        if (!info.path.isDerivation())
+            continue;
+        auto drv = readInvalidDerivation(info.path);
+        drv.checkInvariants(*this, info.path);
+        std::map<std::string, StorePath> outputs;
+        for (auto & [name, output] : drv.outputsAndOptPaths(*this))
+            if (output.second) // floating CA outputs have no path until built
+                outputs.insert_or_assign(name, *output.second);
+        if (!outputs.empty())
+            backend->registerDerivationOutputs(info.path, outputs);
+    }
+}
+
 void DistributedStore::queryRealisationUncached(
     const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept
 {
@@ -241,7 +304,9 @@ void DistributedStore::addToStore(
     static const StringSet emptyAcls;
     canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(emptyAcls)});
 
-    backend->registerValidPaths(ValidPathInfos{{info.path, info}});
+    /* Route through our override so a copied-in .drv also gets its output map
+       registered (the build needs it). */
+    registerValidPaths(ValidPathInfos{{info.path, info}});
 
     outputLock.setDeletion(true);
 }
@@ -312,19 +377,22 @@ StorePath DistributedStore::addToStoreFromDump(
 
     auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), narHash.hash);
     info.narSize = narHash.numBytesDigested;
-    backend->registerValidPaths(ValidPathInfos{{info.path, info}});
+    /* Route through our override so a derivation written via this path (e.g.
+       `writeDerivation`, which uses addToStoreFromDump) also gets its output
+       map registered. */
+    registerValidPaths(ValidPathInfos{{info.path, info}});
 
     outputLock.setDeletion(true);
     return dstPath;
 }
 
-std::filesystem::path DistributedStore::addPermRoot(const StorePath & storePath, const std::filesystem::path & gcRoot)
+void DistributedStore::addIndirectRoot(const std::filesystem::path & gcRoot)
 {
-    /* Create the user-visible symlink locally, and register the root in the
-       shared database so every node's collector sees it. */
-    replaceSymlink(printStorePath(storePath), gcRoot);
+    /* IndirectRootStore::addPermRoot has already created the user-facing symlink
+       (gcRoot -> store path); record the root in the shared database so every
+       node's collector sees it. */
+    auto storePath = parseStorePath(readLink(gcRoot).string());
     backend->addRoot(gcRoot.string(), storePath);
-    return gcRoot;
 }
 
 Roots DistributedStore::findRoots(bool censor)
@@ -423,6 +491,14 @@ std::optional<TrustedFlag> DistributedStore::isTrustedClient()
 void DistributedStore::addTempRoot(const StorePath & path)
 {
     backend->addTempRoot(nodeId, path, tempRootTtlSeconds);
+}
+
+std::unique_ptr<BuildLock> DistributedStore::tryLockBuild(const StorePath & drvPath)
+{
+    auto drv = printStorePath(drvPath);
+    if (!backend->acquireBuildLock(drv, nodeId, buildLockTtlSeconds))
+        return nullptr; // another node is building this derivation
+    return std::make_unique<DistributedBuildLock>(backend.get(), std::move(drv), nodeId);
 }
 
 static RegisterStoreImplementation<DistributedStore::Config> regDistributedStore;

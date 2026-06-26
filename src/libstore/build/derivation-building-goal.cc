@@ -434,6 +434,13 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
         return LocalBuildCapability{*localStoreP, ext};
     }();
 
+    /* A single cluster-wide build lock for this derivation, shared by all the
+       build-attempt lambdas below (captured by reference). It is acquired once
+       (the first time `acquireResources` runs) and then moved into whichever
+       build coroutine actually runs, which holds it for the build's duration.
+       For non-clustered stores this is a no-op handle. See `Store::tryLockBuild`. */
+    std::unique_ptr<BuildLock> buildLock;
+
     auto acquireResources = [&](bool & done, PathLocks & outputLocks) -> Goal::Co {
         trace("trying to build");
 
@@ -482,6 +489,21 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
             } while (!outputLocks.lockPaths(lockFiles, "", false));
         }
 
+        /* The local PathLocks above only exclude builders on this machine. On a
+           store shared by a cluster, also take a cluster-wide per-derivation
+           lock so two nodes never build the same derivation at once. While
+           another node holds it, wait and retry; when it releases (because it
+           finished, succeeded or failed), we acquire it and the validity
+           recheck below decides whether to reuse its result or build. For
+           non-clustered stores this is a no-op handle acquired immediately.
+
+           Acquire once and keep it: `acquireResources` can run again for the
+           same goal (e.g. the hook declines and we fall back to a local build),
+           and re-acquiring would drop and retake the lock. */
+        while (!buildLock)
+            if (!(buildLock = worker.store.tryLockBuild(drvPath)))
+                co_await waitForAWhile();
+
         /* Now check again whether the outputs are valid.  This is because
            another process may have started building in parallel.  After
            it has finished and released the locks, we can (and should)
@@ -495,6 +517,7 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
             debug("skipping build of derivation '%s', someone beat us to it", worker.store.printStorePath(drvPath));
             outputLocks.setDeletion(true);
             outputLocks.unlock();
+            buildLock.reset(); // release the cluster build lock; we didn't build
             done = true;
             co_return Return{};
         }
@@ -527,7 +550,11 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
                    EOF from the hook. */
                 valid = true;
                 co_return buildWithHook(
-                    std::move(inputPaths), std::move(initialOutputs), std::move(drvOptions), std::move(outputLocks));
+                    std::move(inputPaths),
+                    std::move(initialOutputs),
+                    std::move(drvOptions),
+                    std::move(outputLocks),
+                    std::move(buildLock));
             case rpDecline:
                 // We should do it ourselves.
                 co_return Return{};
@@ -577,7 +604,11 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
             co_return doneSuccess(BuildResult::Success::AlreadyValid, checkPathValidity(initialOutputs).second);
         } else {
             co_return buildWithHook(
-                std::move(inputPaths), std::move(initialOutputs), std::move(drvOptions), std::move(outputLocks));
+                std::move(inputPaths),
+                std::move(initialOutputs),
+                std::move(drvOptions),
+                std::move(outputLocks),
+                std::move(buildLock));
         }
     };
 
@@ -590,7 +621,12 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
 
             valid = true;
             co_return buildLocally(
-                *cap, std::move(inputPaths), std::move(initialOutputs), std::move(drvOptions), std::move(outputLocks));
+                *cap,
+                std::move(inputPaths),
+                std::move(initialOutputs),
+                std::move(drvOptions),
+                std::move(outputLocks),
+                std::move(buildLock));
         }
 
         co_return Return{};
@@ -644,7 +680,8 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
     StorePathSet inputPaths,
     std::map<std::string, InitialOutput> initialOutputs,
     DerivationOptions<StorePath> drvOptions,
-    PathLocks outputLocks)
+    PathLocks outputLocks,
+    std::unique_ptr<BuildLock> buildLock)
 {
 #ifdef _WIN32 // TODO enable build hook on Windows
     unreachable();
@@ -863,7 +900,8 @@ Goal::Co DerivationBuildingGoal::buildLocally(
     StorePathSet inputPaths,
     std::map<std::string, InitialOutput> initialOutputs,
     DerivationOptions<StorePath> drvOptions,
-    PathLocks outputLocks)
+    PathLocks outputLocks,
+    std::unique_ptr<BuildLock> buildLock)
 {
     co_await yield();
 

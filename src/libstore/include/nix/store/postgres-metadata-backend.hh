@@ -85,6 +85,9 @@ struct PostgresMetadataBackend : MetadataBackend
     void addTempRoot(const std::string & node, const StorePath & path, uint64_t ttlSeconds) override;
     void renewTempRoots(const std::string & node, uint64_t ttlSeconds) override;
     StorePathSet queryLiveTempRoots() override;
+    bool acquireBuildLock(const std::string & drvPath, const std::string & holder, uint64_t ttlSeconds) override;
+    void releaseBuildLock(const std::string & drvPath, const std::string & holder) override;
+    void renewBuildLocks(const std::string & holder, uint64_t ttlSeconds) override;
 
     /**
      * Record the static output mapping of a derivation.
@@ -97,7 +100,8 @@ struct PostgresMetadataBackend : MetadataBackend
      * that a derivation's validity and its output mapping are committed in a
      * single transaction, matching `LocalStore`'s behaviour.
      */
-    void registerDerivationOutputs(const StorePath & deriver, const std::map<std::string, StorePath> & outputs);
+    void
+    registerDerivationOutputs(const StorePath & deriver, const std::map<std::string, StorePath> & outputs) override;
 
 private:
     const StoreDirConfig & store;

@@ -112,3 +112,15 @@ create table if not exists TempRoots (
 );
 
 create index if not exists IndexTempRootsExpires on TempRoots(expires);
+
+-- Per-derivation build lock: ensures two nodes never build the same derivation
+-- at once. A node claims the row for a drv when it is unheld or its holder's
+-- lease has expired; `expires` (epoch seconds) bounds a crashed builder. The
+-- holder renews via a heartbeat and deletes the row when the build finishes.
+create table if not exists BuildLocks (
+    drv_path text primary key,                     -- the derivation being built
+    holder   text,                                 -- node id currently building it
+    expires  bigint not null                       -- epoch seconds when it lapses
+);
+
+create index if not exists IndexBuildLocksHolder on BuildLocks(holder);

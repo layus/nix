@@ -204,6 +204,12 @@ void PostgresMetadataBackend::initSchema()
             primary key (node, path)
         );
         create index if not exists IndexTempRootsExpires on TempRoots(expires);
+        create table if not exists BuildLocks (
+            drv_path text primary key,
+            holder   text,
+            expires  bigint not null
+        );
+        create index if not exists IndexBuildLocksHolder on BuildLocks(holder);
     )sql";
     exec(schema);
 }
@@ -587,6 +593,44 @@ StorePathSet PostgresMetadataBackend::queryLiveTempRoots()
     for (int i = 0; i < res.ntuples(); ++i)
         paths.insert(store.parseStorePath(res.get(i, 0)));
     return paths;
+}
+
+bool PostgresMetadataBackend::acquireBuildLock(
+    const std::string & drvPath, const std::string & holder, uint64_t ttlSeconds)
+{
+    auto lock = std::scoped_lock(mutex);
+    int64_t now = (int64_t) time(nullptr);
+    int64_t expires = now + (int64_t) ttlSeconds;
+
+    /* Atomic conditional acquire as a single auto-committed statement: claim the
+       row if it is absent, already ours, or its lease has expired. `INSERT … ON
+       CONFLICT DO UPDATE … WHERE` is evaluated atomically by the database, so
+       two nodes racing for the same derivation can't both win. (We avoid an
+       explicit transaction with `SELECT … FOR UPDATE` here: holding a row lock
+       across the surrounding store operations left the row invisible to other
+       connections until the build finished, defeating cross-node exclusion.) */
+    Result(execParams(
+        "insert into BuildLocks (drv_path, holder, expires) values ($1, $2, $3) "
+        "on conflict (drv_path) do update set holder = $2, expires = $3 "
+        "where BuildLocks.holder is null or BuildLocks.holder = $2 or BuildLocks.expires <= $4",
+        {drvPath, holder, std::to_string(expires), std::to_string(now)}));
+
+    /* We hold it iff the row's holder is now us. */
+    Result cur(execParams("select holder from BuildLocks where drv_path = $1", {drvPath}));
+    return cur.ntuples() > 0 && !cur.isNull(0, 0) && cur.get(0, 0) == holder;
+}
+
+void PostgresMetadataBackend::releaseBuildLock(const std::string & drvPath, const std::string & holder)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result(execParams("delete from BuildLocks where drv_path = $1 and holder = $2", {drvPath, holder}));
+}
+
+void PostgresMetadataBackend::renewBuildLocks(const std::string & holder, uint64_t ttlSeconds)
+{
+    auto lock = std::scoped_lock(mutex);
+    int64_t expires = (int64_t) time(nullptr) + (int64_t) ttlSeconds;
+    Result(execParams("update BuildLocks set expires = $1 where holder = $2", {std::to_string(expires), holder}));
 }
 
 } // namespace nix

@@ -385,6 +385,19 @@ public:
  * underlying resource, which could be an external process (daemon
  * server), file system state, etc.
  */
+
+/**
+ * An opaque handle to a held, cluster-wide exclusive lock for building a
+ * derivation. The lock is released when the handle is destroyed. The base type
+ * is a no-op handle (used by stores that need no cross-node build
+ * coordination); `Store::tryLockBuild` may return a subclass that releases a
+ * real lock on destruction.
+ */
+struct BuildLock
+{
+    virtual ~BuildLock() = default;
+};
+
 class Store : public std::enable_shared_from_this<Store>, public StoreDirConfig
 {
     /* VTable anchor to avoid weak linkage of the vtable - it breaks
@@ -757,6 +770,20 @@ public:
         const std::vector<DerivedPath> & paths,
         BuildMode buildMode = bmNormal,
         std::shared_ptr<Store> evalStore = nullptr);
+
+    /**
+     * Try to acquire a cluster-wide exclusive lock for building the derivation
+     * `drvPath`, so that two nodes sharing a store never build the same
+     * derivation at once. Returns a handle that releases the lock when
+     * destroyed, or `nullptr` if the lock is currently held by another node (in
+     * which case the caller should wait and re-check output validity). The
+     * default — for stores that need no such coordination — returns a non-null
+     * no-op handle immediately.
+     */
+    virtual std::unique_ptr<BuildLock> tryLockBuild(const StorePath & drvPath)
+    {
+        return std::make_unique<BuildLock>();
+    }
 
     /**
      * Like buildPaths(), but return a vector of \ref BuildResult

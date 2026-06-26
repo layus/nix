@@ -124,6 +124,15 @@ struct MetadataBackend
     virtual void registerValidPaths(const ValidPathInfos & infos) = 0;
 
     /**
+     * Record the output mapping (output name -> output path) of the derivation
+     * at `deriver`. Called by the store after registering a `.drv`'s validity,
+     * since extracting the outputs requires parsing the derivation content
+     * (which lives on the shared filesystem, not in the database). Idempotent.
+     */
+    virtual void registerDerivationOutputs(
+        const StorePath & deriver, const std::map<std::string, StorePath> & outputs) = 0;
+
+    /**
      * Replace the signatures attached to `path`. Atomic with respect to
      * concurrent readers/writers of that path's row.
      */
@@ -212,6 +221,26 @@ struct MetadataBackend
      * The set of all non-expired temporary roots across the whole cluster.
      */
     virtual StorePathSet queryLiveTempRoots() = 0;
+
+    /**
+     * Try to acquire the cluster-wide exclusive build lock for derivation
+     * `drvPath` on behalf of `holder`, valid for `ttlSeconds`. Returns false if
+     * another holder's lease on that derivation is still valid. Acquiring
+     * renews the lease if `holder` already holds it.
+     */
+    virtual bool acquireBuildLock(const std::string & drvPath, const std::string & holder, uint64_t ttlSeconds) = 0;
+
+    /**
+     * Release the build lock on `drvPath` if held by `holder` (no-op
+     * otherwise).
+     */
+    virtual void releaseBuildLock(const std::string & drvPath, const std::string & holder) = 0;
+
+    /**
+     * Push the expiry of every build lock held by `holder` forward by
+     * `ttlSeconds` (the heartbeat), so a long build does not lose its lock.
+     */
+    virtual void renewBuildLocks(const std::string & holder, uint64_t ttlSeconds) = 0;
 };
 
 } // namespace nix

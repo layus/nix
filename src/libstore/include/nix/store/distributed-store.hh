@@ -5,7 +5,7 @@
 
 #if NIX_WITH_POSTGRES
 
-#  include "nix/store/local-fs-store.hh"
+#  include "nix/store/local-store.hh"
 #  include "nix/store/metadata-backend.hh"
 
 #  include <condition_variable>
@@ -24,11 +24,12 @@ struct DistributedStore;
  * cluster opens the same store; the database provides the cross-node
  * atomicity and replication.
  */
-struct DistributedStoreConfig : std::enable_shared_from_this<DistributedStoreConfig>, virtual LocalFSStoreConfig
+struct DistributedStoreConfig : virtual LocalStoreConfig
 {
     DistributedStoreConfig(const Params & params)
         : StoreConfig(params, FilePathType::Native)
         , LocalFSStoreConfig(params)
+        , LocalStoreConfig(params)
     {
     }
 
@@ -67,16 +68,19 @@ private:
 
 /**
  * A store whose content is served from a shared filesystem and whose metadata
- * is served from a shared `MetadataBackend`. Read/query operations and path
- * registration are routed to the backend; content reads come from the shared
- * filesystem via `LocalFSStore`.
+ * is served from a shared `MetadataBackend`. It is a full `LocalStore`, so it
+ * can build derivations locally (writing outputs into the shared `real=`
+ * filesystem); the metadata virtuals are overridden so the cluster-wide
+ * database — not the node-local SQLite that `LocalStore` opens — is the source
+ * of truth. The node-local SQLite is therefore vestigial; the `state=` dir must
+ * be node-local and distinct from any system store.
+ *
+ * Cross-node build coordination uses a per-derivation lock in the database (see
+ * `tryLockBuild`), so two nodes never build the same derivation at once.
  *
  * Experimental and in development (built only with the `postgres` feature).
- * Content-mutating operations (`addToStore`), garbage collection, and build
- * logs are not yet implemented; builds are expected to happen locally on each
- * node and their results copied/registered into the shared store.
  */
-struct DistributedStore : virtual LocalFSStore
+struct DistributedStore : virtual LocalStore
 {
     using Config = DistributedStoreConfig;
 
@@ -100,7 +104,12 @@ struct DistributedStore : virtual LocalFSStore
     void queryRealisationUncached(
         const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override;
 
-    /* --- content mutation: not yet implemented --- */
+    /* Route build-output (and other) registration to the shared database
+       instead of the node-local SQLite. The single-path `registerValidPath`
+       inherited from LocalStore delegates to this. */
+    void registerValidPaths(const ValidPathInfos & infos) override;
+
+    /* --- content mutation --- */
     void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override;
     StorePath addToStoreFromDump(
         Source & dump,
@@ -111,11 +120,12 @@ struct DistributedStore : virtual LocalFSStore
         const StorePathSet & references,
         RepairFlag repair) override;
 
-    /* --- garbage collection: not yet implemented (see the DB-coordinated GC
-       design) --- */
+    /* --- garbage collection: DB-coordinated (lease + roots + temp roots) --- */
     Roots findRoots(bool censor) override;
     void collectGarbage(const GCOptions & options, GCResults & results) override;
-    std::filesystem::path addPermRoot(const StorePath & storePath, const std::filesystem::path & gcRoot) override;
+    /* `addPermRoot` is `final` in IndirectRootStore; it creates the user-facing
+       symlink and calls this, which records the root in the shared database. */
+    void addIndirectRoot(const std::filesystem::path & path) override;
 
     /* --- build logs: not yet implemented --- */
     std::optional<std::string> getBuildLogExact(const StorePath & path) override;
@@ -129,6 +139,14 @@ struct DistributedStore : virtual LocalFSStore
      * heartbeat thread until this store is destroyed.
      */
     void addTempRoot(const StorePath & path) override;
+
+    /**
+     * Acquire the cluster-wide per-derivation build lock in the database, so no
+     * two nodes build the same derivation at once. Returns a handle that
+     * releases the lock when destroyed, or `nullptr` if another node currently
+     * holds it. Held locks are kept alive by the heartbeat thread.
+     */
+    std::unique_ptr<BuildLock> tryLockBuild(const StorePath & drvPath) override;
 
 private:
     void anchor() override;
