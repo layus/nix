@@ -64,6 +64,29 @@ target). Validated paths:
 
 See `smoke-test.sh` to reproduce.
 
+### Two-node cooperation + failover (Docker)
+
+`cluster-test.sh` proves that **two separate nodes cooperate**. It brings up a
+CockroachDB container and two gRPC store nodes as independent Docker containers
+that share one database and one content volume (the nodes never talk to each
+other — they cooperate only through that shared backing state). Using the host's
+`nix` as the client, it: writes a path via node1 only, reads and verifies it via
+node2 only (shared metadata + shared content), then stops node1 and confirms the
+cluster URI (`grpc://h1?nodes=h1,h2`) keeps serving via node2 (client failover),
+and that node1 serves again after rejoining.
+
+It reuses the binaries from the meson build directory (bind-mounting the host
+`/nix/store` read-only), so it needs a grpc+postgres build present in
+`$BUILD_DIR` (default `./build-both`) and Docker. Run from the repo root:
+
+```
+./src/libstore/distributed/cluster-test.sh
+```
+
+Builds are out of scope here: a node's backing store is `distributed://` (a
+content+metadata store, not a builder). Build-over-gRPC is validated separately
+against a daemon-backed server (see `grpc.md`).
+
 ## Status / roadmap
 
 - [x] `MetadataBackend` interface (the seam).
