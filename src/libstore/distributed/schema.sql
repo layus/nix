@@ -124,3 +124,18 @@ create table if not exists BuildLocks (
 );
 
 create index if not exists IndexBuildLocksHolder on BuildLocks(holder);
+
+-- Schema-initialisation coordination. When several nodes open a brand-new
+-- database at once, running the DDL above from all of them races (the database
+-- rejects concurrent CREATE TABLEs). Instead this single tiny table is created
+-- first (the only DDL the nodes still run concurrently; the backend retries it),
+-- then exactly one node is elected to create the rest of the schema while the
+-- others wait: a node claims the row by setting `creator` (with an `expires`
+-- lease so the election survives a crashed creator), builds the schema, and
+-- sets `ready = 1`; the waiters poll `ready` and then do nothing.
+create table if not exists SchemaInit (
+    id      integer primary key,                     -- always 1 (single row)
+    ready   integer not null default 0,              -- 1 once the schema exists
+    creator text,                                    -- node currently initialising
+    expires bigint not null default 0                -- epoch seconds; creator lease
+);

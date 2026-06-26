@@ -121,8 +121,7 @@ against a daemon-backed server (see `grpc.md`).
       shared dir and in Postgres/CockroachDB, and a second node sees it. So a
       node's gRPC server, backing a `distributed://` store, can now actually
       run builds (not just forward them). Each node needs its own node-local
-      `state=` dir; opening a brand-new store from several nodes at once can
-      race on `initSchema` (serialise node startup or pre-create the schema).
+      `state=` dir.
 - [x] **Per-derivation DB build lock** so two nodes never build the same
       derivation at once: a `BuildLocks` table (`drv_path` PK + holder + TTL,
       modelled on `GCLease`), `acquire/release/renewBuildLock` on the backend,
@@ -130,8 +129,17 @@ against a daemon-backed server (see `grpc.md`).
       build goal that holds a single cluster lock for the build's duration
       alongside the existing machine-local `PathLocks`. Held and released
       correctly around a build; isolating its cross-node effect on a single
-      host is masked by `PathLocks`/SQLite/`initSchema` serialisation, so
-      multi-host enforcement is pending verification on a real cluster.
+      host is masked by `PathLocks`/SQLite serialisation, so multi-host
+      enforcement is pending verification on a real cluster.
+- [x] **Race-free schema initialisation.** Several nodes opening a brand-new
+      database at once previously raced on the `CREATE TABLE`s (the database
+      rejects concurrent DDL). Now a one-row `SchemaInit` table is bootstrapped
+      first (the only still-concurrent DDL, retried on the transient error),
+      then a single node is elected — via a `creator` claim with an `expires`
+      lease so the election survives a crashed creator — to build the rest of
+      the schema while the others wait on a `ready` flag. Runtime-validated:
+      5 nodes opening one fresh database concurrently all succeed, with the
+      schema created exactly once.
 - [x] DB-coordinated GC: a shared `GCRoots` table (replacing the per-node
       gcroots scan) and a single-row `GCLease` (one collector at a time).
       `addPermRoot` registers roots, `findRoots` reads the cluster-wide union,

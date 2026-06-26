@@ -13,6 +13,7 @@
 #  include <libpq-fe.h>
 
 #  include <ctime>
+#  include <unistd.h>
 #  include <vector>
 
 namespace nix {
@@ -211,7 +212,67 @@ void PostgresMetadataBackend::initSchema()
         );
         create index if not exists IndexBuildLocksHolder on BuildLocks(holder);
     )sql";
-    exec(schema);
+
+    /* Several nodes may open a brand-new database at the same time. Running the
+       schema DDL from all of them at once makes the database reject the
+       concurrent `CREATE TABLE`s ("schema change in progress"), so we serialise
+       initialisation: a single elected node creates the schema while the others
+       wait. */
+
+    /* Bootstrap a one-row coordination table. Creating *it* is the only DDL
+       that the nodes can still run concurrently, so retry it on the transient
+       schema-change error; `if not exists` makes the retry idempotent. */
+    for (int attempt = 0;; ++attempt) {
+        try {
+            exec(
+                "create table if not exists SchemaInit ("
+                "  id      integer primary key,"
+                "  ready   integer not null default 0,"
+                "  creator text,"
+                "  expires bigint not null default 0"
+                ")");
+            break;
+        } catch (Error &) {
+            if (attempt >= 50)
+                throw;
+            usleep(200 * 1000);
+        }
+    }
+    exec("insert into SchemaInit (id) values (1) on conflict (id) do nothing");
+
+    /* Elect a single creator: the first node to claim the row (or to reclaim it
+       if a previous creator died before finishing) builds the full schema and
+       sets `ready`; every other node waits until `ready` is set, then returns
+       without touching the schema. The bulk DDL is thus never run concurrently.
+       A `creator` lease (TTL) makes the election survive a crash mid-init. */
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    std::string creator = std::string(host) + ":" + std::to_string(getpid());
+    const int64_t leaseTtl = 60;
+    for (int attempt = 0; attempt < 1200; ++attempt) {
+        int64_t now = (int64_t) time(nullptr);
+
+        Result st(execParams("select ready from SchemaInit where id = 1", {}));
+        if (st.ntuples() > 0 && st.get(0, 0) == "1")
+            return; // schema already initialised
+
+        /* Atomically take (or reclaim, if expired) the creator role. */
+        Result(execParams(
+            "update SchemaInit set creator = $1, expires = $2 "
+            "where id = 1 and ready = 0 and (creator is null or expires < $3)",
+            {creator, std::to_string(now + leaseTtl), std::to_string(now)}));
+
+        Result who(execParams("select creator from SchemaInit where id = 1", {}));
+        if (who.ntuples() > 0 && !who.isNull(0, 0) && who.get(0, 0) == creator) {
+            /* We won the election: create the schema (idempotent), then publish. */
+            exec(schema);
+            exec("update SchemaInit set ready = 1 where id = 1");
+            return;
+        }
+
+        usleep(100 * 1000); // another node is initialising; wait and re-check
+    }
+    throw Error("timed out waiting for another node to initialise the metadata database schema");
 }
 
 /* ------------------------------------------------------------------ *
