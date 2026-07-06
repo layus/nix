@@ -14,6 +14,7 @@
 #  include "nix/store/gc-store.hh"
 #  include "nix/store/build-result.hh"
 #  include "nix/util/hash.hh"
+#  include "nix/util/logging.hh"
 
 #  include "nix-store.pb.h"
 
@@ -76,6 +77,27 @@ inline ValidPathInfo fromProto(const StoreDirConfig & store, const pb::PathInfo 
     info.ultimate = in.ultimate();
     info.registrationTime = in.registration_time();
     return info;
+}
+
+/** Logger fields → proto, for build-event forwarding. */
+inline void toProto(const Logger::Fields & fields, google::protobuf::RepeatedPtrField<pb::LogField> & out)
+{
+    for (auto & f : fields) {
+        auto & pf = *out.Add();
+        if (f.type == Logger::Field::tInt)
+            pf.set_num(f.i);
+        else
+            pf.set_str(f.s);
+    }
+}
+
+/** Logger fields ← proto, for build-event replay. */
+inline Logger::Fields fromProto(const google::protobuf::RepeatedPtrField<pb::LogField> & fields)
+{
+    Logger::Fields res;
+    for (auto & pf : fields)
+        res.push_back(pf.has_num() ? Logger::Field(pf.num()) : Logger::Field(pf.str()));
+    return res;
 }
 
 /** Fill a proto `Realisation` from `id` + an (unkeyed) realisation. */

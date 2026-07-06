@@ -32,55 +32,86 @@ using grpc::ServerContext;
 using grpc::Status;
 using grpc::StatusCode;
 
-/* A Logger that forwards build output and progress to the client as
-   `BuildEvent` log lines. Installed as the global logger for the duration of a
-   build; its writes are serialised against the build thread / activity
-   callbacks. */
+/* A Logger that forwards the server's log/activity stream to the client as
+   structured `BuildEvent`s — the gRPC analogue of the daemon's TunnelLogger.
+   Installed as the global logger for the duration of a build; its writes are
+   serialised against the build thread / activity callbacks.
+
+   Activities, stops, and results are forwarded unconditionally (they carry
+   the levels; the client's own logger decides what to display). Plain log
+   messages are gated on the verbosity the client sent with the request. */
 struct GrpcLogger : Logger
 {
     grpc::ServerWriter<pb::BuildEvent> * writer;
+    Verbosity clientVerbosity;
     std::mutex mutex;
 
-    GrpcLogger(grpc::ServerWriter<pb::BuildEvent> * writer)
+    GrpcLogger(grpc::ServerWriter<pb::BuildEvent> * writer, Verbosity clientVerbosity)
         : writer(writer)
+        , clientVerbosity(clientVerbosity)
     {
     }
 
-    void emit(const std::string & line)
+    void write(const pb::BuildEvent & ev)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        pb::BuildEvent ev;
-        ev.set_log_line(line);
         writer->Write(ev);
+    }
+
+    void logMsg(Verbosity lvl, std::string text)
+    {
+        pb::BuildEvent ev;
+        auto & l = *ev.mutable_log();
+        l.set_level(lvl);
+        l.set_text(std::move(text));
+        write(ev);
     }
 
     void log(Verbosity lvl, std::string_view s) override
     {
-        if (lvl <= verbosity)
-            emit(std::string(s));
+        if (lvl <= clientVerbosity)
+            logMsg(lvl, std::string(s));
     }
 
     void logEI(const ErrorInfo & ei) override
     {
-        if (ei.level > verbosity)
+        if (ei.level > clientVerbosity)
             return;
         std::ostringstream oss;
         showErrorInfo(oss, ei, false);
-        emit(oss.str());
-    }
-
-    void result(ActivityId, ResultType type, const Fields & fields) override
-    {
-        if ((type == resBuildLogLine || type == resPostBuildLogLine) && !fields.empty()
-            && fields[0].type == Logger::Field::tString)
-            emit(fields[0].s);
+        logMsg(ei.level, oss.str());
     }
 
     void startActivity(
-        ActivityId, Verbosity lvl, ActivityType, const std::string & s, const Fields &, ActivityId) override
+        ActivityId act, Verbosity lvl, ActivityType type, const std::string & s, const Fields & fields, ActivityId parent)
+        override
     {
-        if (lvl <= verbosity && !s.empty())
-            emit(s);
+        pb::BuildEvent ev;
+        auto & st = *ev.mutable_start();
+        st.set_id(act);
+        st.set_level(lvl);
+        st.set_type(type);
+        st.set_text(s);
+        toProto(fields, *st.mutable_fields());
+        st.set_parent(parent);
+        write(ev);
+    }
+
+    void stopActivity(ActivityId act) override
+    {
+        pb::BuildEvent ev;
+        ev.mutable_stop()->set_id(act);
+        write(ev);
+    }
+
+    void result(ActivityId act, ResultType type, const Fields & fields) override
+    {
+        pb::BuildEvent ev;
+        auto & r = *ev.mutable_act_result();
+        r.set_id(act);
+        r.set_type(type);
+        toProto(fields, *r.mutable_fields());
+        write(ev);
     }
 };
 
@@ -320,7 +351,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
             {
                 /* Forward the build's logs/progress to the client while it runs. */
                 std::lock_guard<std::mutex> buildLock(buildMutex);
-                GrpcLogger grpcLogger(writer);
+                GrpcLogger grpcLogger(writer, (Verbosity) req->verbosity());
                 auto * prevLogger = logger;
                 logger = &grpcLogger;
                 Finally restoreLogger([&]() { logger = prevLogger; });
@@ -353,7 +384,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
             BuildResult result;
             {
                 std::lock_guard<std::mutex> buildLock(buildMutex);
-                GrpcLogger grpcLogger(writer);
+                GrpcLogger grpcLogger(writer, (Verbosity) req->verbosity());
                 auto * prevLogger = logger;
                 logger = &grpcLogger;
                 Finally restoreLogger([&]() { logger = prevLogger; });

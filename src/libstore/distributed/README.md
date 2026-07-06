@@ -262,11 +262,26 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       same latent pattern exists upstream in `RemoteStore`'s pre-1.34
       fallback, `remote-store.cc`.) Runtime-validated: fresh build over
       `grpc://` with `ca-derivations` on now exits 0.
-- [ ] gRPC ↔ status error-mapping refinements; richer progress forwarding;
-      dynamic node discovery: the NFS registry convention (`/var/replicas`,
-      see `simple-test.sh`) folded into `nix-grpc-store-server`; a client that
-      cannot read the registry must report an error and shut down (no fallback
-      discovery path).
+- [x] **Structured build-log forwarding** — the gRPC analogue of the daemon's
+      `TunnelLogger`/`processStderr` pair. The server-side `GrpcLogger` used to
+      flatten everything (activities, progress, log lines) into bare strings
+      that the client printed at `lvlInfo`, so levels, the activity tree, and
+      progress were lost and builder output spammed the client even without
+      `-L`. Now `BuildEvent` carries the `Logger` calls verbatim (log messages
+      with their level, activity start/stop with type/fields/parent, results
+      including `resBuildLogLine` and progress), and the client replays them
+      into its own logger, mapping server activity ids onto fresh local RAII
+      `Activity` objects (a mid-stream failover retry stops any orphans). The
+      client sends its verbosity with the build request; the server gates
+      plain log messages on it. Runtime-validated: `nix build -L` over
+      `grpc://` renders builder lines with the local `drvname>` prefix exactly
+      like a local build, without `-L` they are suppressed, and a failing
+      build streams its last lines live before the structured error.
+- [ ] gRPC ↔ status error-mapping refinements (e.g. the redundant nested
+      `error:` prefix on remote build failures); dynamic node discovery: the
+      NFS registry convention (`/var/replicas`, see `simple-test.sh`) folded
+      into `nix-grpc-store-server`; a client that cannot read the registry
+      must report an error and shut down (no fallback discovery path).
 - [ ] **Investigate an intermittent gRPC build-client hang.** During the NFS
       concurrent-build stress test (`stress-test.sh`) the `nix build … ^*` client
       was observed **once** to hang indefinitely *after* the build had already

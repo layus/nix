@@ -119,20 +119,43 @@ message QueryMissingReply {
   uint64 nar_size                = 5;
 }
 
-message BuildPathsRequest      { repeated string drvd_paths = 1; BuildMode mode = 2; }
-message BuildDerivationRequest { string drv_path = 1; bytes drv = 2; BuildMode mode = 3; }
+// `verbosity` is the client's Verbosity: the server only forwards plain log
+// messages up to that level (activities/results always flow; the client's own
+// logger decides what to display).
+message BuildPathsRequest      { repeated string drvd_paths = 1; BuildMode mode = 2; uint32 verbosity = 3; }
+message BuildDerivationRequest { string drv_path = 1; bytes drv = 2; BuildMode mode = 3; uint32 verbosity = 4; }
 enum BuildMode { NORMAL = 0; REPAIR = 1; CHECK = 2; }
 
-// One streamed build event: a log line, an activity/progress update, or the
-// terminal result. Replaces the worker protocol's STDERR_* multiplex.
+// One streamed build event: a structured log/activity event or the terminal
+// result. Replaces the worker protocol's STDERR_* multiplex: the server
+// forwards its Logger calls verbatim (levels, activity tree, progress
+// results); the client replays them into its own logger, mapping the server's
+// activity ids onto fresh local Activity objects. Level/type/result-type
+// values are Nix's Verbosity/ActivityType/ResultType enums, sent raw (both
+// ends are built from the same tree while this protocol is WIP).
+message LogField { oneof value { uint64 num = 1; string str = 2; } }
+message LogMsg         { uint32 level = 1; string text = 2; }
+message ActivityStart  {
+  uint64 id       = 1;
+  uint32 level    = 2;
+  uint32 type     = 3;
+  string text     = 4;
+  repeated LogField fields = 5;
+  uint64 parent   = 6;
+}
+message ActivityStop   { uint64 id = 1; }
+message ActivityResult { uint64 id = 1; uint32 type = 2; repeated LogField fields = 3; }
+
 message BuildEvent {
+  reserved 1, 2; // were: string log_line, ActivityUpdate activity (flattened forwarding)
   oneof event {
-    string log_line      = 1;
-    ActivityUpdate activity = 2;
-    BuildResult result   = 3; // terminal
+    BuildResult result        = 3; // terminal
+    LogMsg log                = 4;
+    ActivityStart start       = 5;
+    ActivityStop stop         = 6;
+    ActivityResult act_result = 7;
   }
 }
-message ActivityUpdate { uint64 id = 1; string text = 2; uint64 done = 3; uint64 expected = 4; }
 message BuildResult {
   bool success = 1;
   string error = 2;

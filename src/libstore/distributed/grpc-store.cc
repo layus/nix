@@ -29,6 +29,46 @@
 
 namespace nix {
 
+namespace {
+
+/* Replays streamed `BuildEvent`s from the server into the local logger, so a
+   remote build renders exactly like a local one (activity tree, levels,
+   progress, `-L` build-log lines). The server's activity ids are mapped onto
+   fresh local `Activity` objects; RAII stops any still-open activities when
+   the player goes out of scope (e.g. a mid-stream failover retry). */
+struct BuildEventPlayer
+{
+    std::map<uint64_t, std::unique_ptr<Activity>> activities;
+
+    void operator()(const grpc_transport::pb::BuildEvent & ev)
+    {
+        if (ev.has_log())
+            logger->log((Verbosity) ev.log().level(), ev.log().text());
+        else if (ev.has_start()) {
+            auto & st = ev.start();
+            auto parent = activities.find(st.parent());
+            activities.emplace(
+                st.id(),
+                std::make_unique<Activity>(
+                    *logger,
+                    (Verbosity) st.level(),
+                    (ActivityType) st.type(),
+                    st.text(),
+                    grpc_transport::fromProto(st.fields()),
+                    parent != activities.end() ? parent->second->id : getCurActivity()));
+        } else if (ev.has_stop())
+            activities.erase(ev.stop().id());
+        else if (ev.has_act_result()) {
+            auto it = activities.find(ev.act_result().id());
+            if (it != activities.end())
+                it->second->result(
+                    (ResultType) ev.act_result().type(), grpc_transport::fromProto(ev.act_result().fields()));
+        }
+    }
+};
+
+} // namespace
+
 struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual StoreConfig
 {
     GrpcStoreConfig(const Params & params)
@@ -402,6 +442,7 @@ struct GrpcStore : virtual Store, virtual GcStore
         for (auto & p : paths)
             req.add_drvd_paths(p.to_string(*this));
         req.set_mode(grpc_transport::toProtoMode(mode));
+        req.set_verbosity(verbosity);
         /* A build is re-run from scratch on failover (already-valid outputs
            short-circuit), so the whole stream read is retriable. */
         bool ok = true;
@@ -413,13 +454,13 @@ struct GrpcStore : virtual Store, virtual GcStore
             err.clear();
             auto reader = stub.BuildPaths(&ctx, req);
             pb::BuildEvent ev;
+            BuildEventPlayer replay;
             while (reader->Read(&ev)) {
-                if (ev.has_log_line())
-                    logger->log(lvlInfo, ev.log_line());
-                else if (ev.has_result()) {
+                if (ev.has_result()) {
                     ok = ev.result().success();
                     err = ev.result().error();
-                }
+                } else
+                    replay(ev);
             }
             return reader->Finish();
         });
@@ -482,6 +523,7 @@ struct GrpcStore : virtual Store, virtual GcStore
         nlohmann::json j = drv;
         req.set_drv(j.dump());
         req.set_mode(grpc_transport::toProtoMode(mode));
+        req.set_verbosity(verbosity);
 
         std::optional<BuildResult> result;
         withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
@@ -490,13 +532,12 @@ struct GrpcStore : virtual Store, virtual GcStore
             result.reset();
             auto reader = stub.BuildDerivation(&ctx, req);
             pb::BuildEvent ev;
+            BuildEventPlayer replay;
             while (reader->Read(&ev)) {
-                if (ev.has_log_line()) {
-                    logger->log(lvlInfo, ev.log_line());
+                if (!ev.has_result()) {
+                    replay(ev);
                     continue;
                 }
-                if (!ev.has_result())
-                    continue;
                 auto & pr = ev.result();
                 BuildResult br;
                 if (pr.success()) {
