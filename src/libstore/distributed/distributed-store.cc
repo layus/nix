@@ -18,6 +18,7 @@
 #  include "nix/util/source-accessor.hh"
 #  include "nix/util/file-content-address.hh"
 #  include "nix/util/finally.hh"
+#  include "nix/util/signals.hh"
 
 #  include <unistd.h>
 
@@ -475,6 +476,75 @@ void DistributedStore::collectGarbage(const GCOptions & options, GCResults & res
     }
 
     backend->removeValidPaths(deleted);
+}
+
+bool DistributedStore::verifyStore(bool checkContents, RepairFlag repair)
+{
+    /* LocalStore::verifyStore would verify (and in repair mode, mutate!) the
+       vestigial node-local SQLite; here the shared database is the source of
+       truth. Repairing would have to coordinate cluster-wide (other nodes may
+       be using the path being rewritten), so it is refused for now. */
+    if (repair)
+        throw Unsupported("repairing the distributed store is not yet supported");
+
+    printInfo("verifying against the shared database...");
+    auto validPaths = queryAllValidPaths();
+
+    bool errors = false;
+
+    printInfo("checking path existence on the shared filesystem...");
+    for (auto & path : validPaths) {
+        checkInterrupt();
+        if (!pathExists(toRealPath(path))) {
+            printError(
+                "path '%s' is valid in the database but missing from the shared filesystem", printStorePath(path));
+            errors = true;
+            continue;
+        }
+        try {
+            auto info = queryPathInfo(path);
+            for (auto & ref : info->references)
+                if (!validPaths.count(ref)) {
+                    printError(
+                        "path '%s' refers to invalid path '%s'", printStorePath(path), printStorePath(ref));
+                    errors = true;
+                }
+        } catch (Error & e) {
+            logError(e.info());
+            errors = true;
+        }
+    }
+
+    if (checkContents) {
+        printInfo("checking store hashes...");
+        for (auto & path : validPaths) {
+            checkInterrupt();
+            try {
+                auto info = queryPathInfo(path);
+                printMsg(lvlTalkative, "checking contents of '%s'", printStorePath(path));
+                auto hashSink = HashSink(info->narHash.algo);
+                dumpPath(toRealPath(path), hashSink);
+                auto current = hashSink.finish();
+                if (info->narHash != current.hash) {
+                    printError(
+                        "path '%s' was modified! expected hash '%s', got '%s'",
+                        printStorePath(path),
+                        info->narHash.to_string(HashFormat::Nix32, true),
+                        current.hash.to_string(HashFormat::Nix32, true));
+                    errors = true;
+                }
+            } catch (Error & e) {
+                /* The path may have been GC'ed by another node meanwhile. */
+                if (isValidPath(path))
+                    logError(e.info());
+                else
+                    logWarning(e.info());
+                errors = true;
+            }
+        }
+    }
+
+    return errors;
 }
 
 std::optional<std::string> DistributedStore::getBuildLogExact(const StorePath &)

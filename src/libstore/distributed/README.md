@@ -221,6 +221,22 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       on any node is protected cluster-wide. Runtime-validated on CockroachDB:
       a copied-but-unrooted path survives GC while its temp root is live and is
       collected once it expires.
+- [x] **SQLite-independence audited; `verifyStore` routed to the backend.**
+      A static audit (every SQLite-touching statement in `local-store.cc`
+      mapped to its enclosing method) plus a runtime check (build + copy +
+      add-file + GC through a node, then dump its `db.sqlite`: 0 rows in
+      `ValidPaths`/`Refs`/`DerivationOutputs`; all metadata in CockroachDB
+      only) confirmed the node-local SQLite is truly vestigial in normal
+      operation — its only remaining role is being opened/created by the
+      inherited `LocalStore` constructor. The one gap found:
+      `LocalStore::verifyStore` (reached via `nix-store --verify`) read — and
+      in repair mode wrote — the empty node-local SQLite. `DistributedStore`
+      now overrides it: every DB-valid path must exist on the shared
+      filesystem, references must be valid, and `--check-contents` re-hashes
+      NARs against the database. Repair mode throws `Unsupported` (it would
+      need cluster-wide coordination). Runtime-validated on a live node:
+      clean store passes, a corrupted file and a removed path are both
+      reported (exit 1), repair is refused.
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).

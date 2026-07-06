@@ -127,6 +127,16 @@ struct DistributedStore : virtual LocalStore
        symlink and calls this, which records the root in the shared database. */
     void addIndirectRoot(const std::filesystem::path & path) override;
 
+    /**
+     * Verify the store against the shared database (NOT the vestigial
+     * node-local SQLite that `LocalStore::verifyStore` would consult):
+     * every DB-valid path must exist on the shared filesystem, its
+     * references must be valid, and with `checkContents` its NAR hash must
+     * match. Repair mode is not yet supported (it would have to coordinate
+     * cluster-wide) and throws.
+     */
+    bool verifyStore(bool checkContents, RepairFlag repair) override;
+
     /* --- build logs: not yet implemented --- */
     std::optional<std::string> getBuildLogExact(const StorePath & path) override;
     void addBuildLog(const StorePath & path, std::string_view log) override;
