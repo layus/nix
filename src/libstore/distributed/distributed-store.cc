@@ -741,24 +741,44 @@ void DistributedStore::stealSome()
     if (active >= maxJobs)
         return;
 
+    auto now = std::chrono::steady_clock::now();
+
     std::vector<DerivedPath> targets;
+    std::vector<StorePath> targetDrvs;
     for (auto & drvPath : backend->queryStealableBuilds(nodeId, maxJobs - active)) {
         /* The .drv must have reached the shared store (the advertiser built
            or imported it there); otherwise leave it to its advertiser. */
         if (!isValidPath(drvPath))
+            continue;
+        /* A failed steal leaves the advertisement live (the advertiser owns
+           it and will build — and properly fail — it itself), so without a
+           cooldown we would re-steal and re-fail the same derivation every
+           poll. */
+        if (auto it = stealFailures.find(drvPath);
+            it != stealFailures.end() && now - it->second < std::chrono::seconds(60))
             continue;
         printInfo("work stealing: building '%s'", printStorePath(drvPath));
         targets.push_back(DerivedPath::Built{
             .drvPath = makeConstantStorePathRef(drvPath),
             .outputs = OutputsSpec::All{},
         });
+        targetDrvs.push_back(drvPath);
     }
     if (targets.empty())
         return;
 
     /* One buildPaths call for the whole batch: the Worker parallelises the
        stolen builds up to max-jobs. */
-    buildPaths(targets);
+    try {
+        buildPaths(targets);
+    } catch (...) {
+        /* No per-target attribution from a batched build: put the whole
+           batch on cooldown (retried after it lapses). */
+        for (auto & drvPath : targetDrvs)
+            stealFailures.insert_or_assign(drvPath, now);
+        std::erase_if(stealFailures, [&](auto & kv) { return now - kv.second > std::chrono::seconds(600); });
+        throw;
+    }
     for (auto & t : targets)
         printInfo("work stealing: built '%s'", t.to_string(*this));
 }

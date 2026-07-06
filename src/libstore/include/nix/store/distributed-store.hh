@@ -288,6 +288,11 @@ private:
     /** Background work stealer (only started with `work-stealing`). */
     std::thread stealerThread;
     void stealSome();
+
+    /** Steals that failed, with when: skipped for a cooldown so a failing
+        advertisement is not re-stolen every poll (only touched by the
+        stealer thread). */
+    std::map<StorePath, std::chrono::steady_clock::time_point> stealFailures;
 };
 
 } // namespace nix
