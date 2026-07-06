@@ -87,6 +87,67 @@ Builds are out of scope here: a node's backing store is `distributed://` (a
 content+metadata store, not a builder). Build-over-gRPC is validated separately
 against a daemon-backed server (see `grpc.md`).
 
+### Concurrent builds over a real NFS share (Docker)
+
+`stress-test.sh` goes further than `cluster-test.sh`: instead of faking the
+shared content plane with a bind mount, it uses a **genuine NFS share** as the
+store (the host exports `/mnt/nix-store` over NFSv4; both nodes are NFS clients
+mounting it read-write), and it makes the nodes **actually build** — with real
+`nixbld` build users and the Nix sandbox (namespaces nested inside privileged
+containers). It then drives concurrent builds:
+
+- **Phase 1** fires the *same* slow derivation at both nodes at once, racing the
+  per-derivation DB build lock (one node builds; the other waits on the lock,
+  then reuses the result). A read-only NFS mount independently confirms the
+  output landed on the share.
+- **Phase 2** builds a large realistic closure (`home-manager` activation
+  package, or any flake attr via `HM_FLAKE`/`HM_ATTR`) at both nodes at once as
+  a throughput stress.
+
+The pass bar is *no crash*: both nodes stay up, and every output is valid on the
+shared store. This test found and fixed a real bug — `addToStore`/
+`addToStoreFromDump` canonicalised with an empty ACL-ignore set, so the
+un-removable `system.nfs4_acl` xattr that NFSv4 synthesises on every file made
+*every* write to an NFS-backed store fail with `EINVAL`; the fix honours the
+`ignored-acls` setting as `LocalStore` does. Run from the repo root (needs the
+host `nfsd` module and an NFSv4 export of `/mnt/nix-store`; see the script
+header for the exact NixOS config):
+
+```
+./src/libstore/distributed/stress-test.sh
+```
+
+### Simple two-node cooperation over NFS (Docker)
+
+`simple-test.sh` is the minimal end-to-end story, kept deliberately small so a
+regression is easy to localise: two gRPC nodes (NFS clients of the host's
+export, sharing one CockroachDB), a derivation **built via node1 only**, and
+the pass bar checked from the *other* node — node2 must report the output as a
+valid path, `nix store verify` must succeed through node2, and an independent
+read-only NFS mount must find the output physically on the export. The build
+is wrapped in `timeout` and a timeout is reported loudly as `HANG`, so it
+doubles as a cheap regression guard for the intermittent gRPC client hang.
+
+It also establishes the **shared-store layout convention**: the NFS export is
+no longer the bare store but a structured share, mounted at `/cluster`, with
+two well-known directories:
+
+- `/store` — the store contents (`real=/cluster/store`);
+- `/var/replicas` — the node registry. Nodes **discover each other** through
+  it: each node registers its gRPC address in `/var/replicas/<name>` once its
+  server is ready, and a client can assemble its failover URI
+  (`grpc://first?nodes=…`) from that registry alone, with no static node list.
+  Discovery requires seeing the share: a client that cannot read the registry
+  must report an error and shut down — there is deliberately no fallback
+  discovery path. (For now the test harness registers on the node's behalf;
+  folding registration into `nix-grpc-store-server` is the natural next step.)
+
+Same host prerequisites as `stress-test.sh`; run from the repo root:
+
+```
+./src/libstore/distributed/simple-test.sh
+```
+
 ## Status / roadmap
 
 - [x] `MetadataBackend` interface (the seam).
@@ -186,8 +247,38 @@ against a daemon-backed server (see `grpc.md`).
       both forward the build (the latter via `buildPathsWithResults`), with the
       builder's output streamed back live (`-L`). Behaves identically to a
       direct build.
+- [x] **Fixed: spurious `MissingRealisation` error after successful gRPC
+      builds.** A client with `ca-derivations` enabled (as in this host's
+      `/etc/nix/nix.conf`) failed every `nix build --store grpc://… <drv>^*`
+      with `cannot operate on output 'out' of the unbuilt derivation …` even
+      though the build had succeeded server-side: `GrpcStore::
+      buildPathsWithResults`, when synthesising per-path results, demanded a
+      registered realisation for every output, but a server without the CA
+      feature never registers realisations for input-addressed builds. This
+      was deterministic, not cosmetic (it had been misread as a `^*` exit-code
+      quirk in the stress test). The fix falls back to the statically resolved
+      output path when no realisation is registered — safe because a genuinely
+      unbuilt CA derivation already throws during `resolveDerivedPath`. (The
+      same latent pattern exists upstream in `RemoteStore`'s pre-1.34
+      fallback, `remote-store.cc`.) Runtime-validated: fresh build over
+      `grpc://` with `ca-derivations` on now exits 0.
 - [ ] gRPC ↔ status error-mapping refinements; richer progress forwarding;
-      dynamic node discovery (DNS / coordinator).
+      dynamic node discovery: the NFS registry convention (`/var/replicas`,
+      see `simple-test.sh`) folded into `nix-grpc-store-server`; a client that
+      cannot read the registry must report an error and shut down (no fallback
+      discovery path).
+- [ ] **Investigate an intermittent gRPC build-client hang.** During the NFS
+      concurrent-build stress test (`stress-test.sh`) the `nix build … ^*` client
+      was observed **once** to hang indefinitely *after* the build had already
+      succeeded server-side (the output was valid on the shared store). It
+      happened on a cold-cache `nixpkgs#hello` built at both nodes simultaneously
+      while both were substituting the closure from `cache.nixos.org`. It could
+      not be reproduced in ~8 varied isolation attempts (single node, same-drv
+      races, dependency chains, and the substitute-during-build scenario all
+      returned cleanly), so it is likely a timing-sensitive interaction (a
+      deadline-less client `Read` stalling while a slow substitution holds the
+      backend's single libpq mutex) rather than a structural deadlock. The stress
+      test wraps every build in `timeout` so it cannot wedge the harness.
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
