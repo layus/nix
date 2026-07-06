@@ -8,6 +8,7 @@
 #  include "nix/store/local-store.hh"
 #  include "nix/store/metadata-backend.hh"
 
+#  include <atomic>
 #  include <condition_variable>
 #  include <map>
 #  include <memory>
@@ -46,6 +47,27 @@ struct DistributedStoreConfig : virtual LocalStoreConfig
           (PostgreSQL, or a PostgreSQL-wire-compatible distributed database
           such as YugabyteDB). For example
           `host=db.example.com dbname=nix user=nix`.
+        )"};
+
+    Setting<bool> workStealing{
+        this,
+        false,
+        "work-stealing",
+        R"(
+          Whether this node steals advertised builds from busier nodes of the
+          cluster when it is otherwise idle. Saturated nodes advertise their
+          ready-to-build derivations; the per-derivation build lock still
+          arbitrates execution, so duplicate builds are impossible. Enable on
+          cluster nodes that run builds (e.g. under `nix-grpc-store-server`);
+          leave off for pure clients.
+        )"};
+
+    Setting<uint64_t> workStealingInterval{
+        this,
+        5,
+        "work-stealing-interval",
+        R"(
+          How often (in seconds) an idle node polls for stealable builds.
         )"};
 
     Setting<uint64_t> gcRootLifetime{
@@ -221,6 +243,16 @@ struct DistributedStore : virtual LocalStore
      */
     std::unique_ptr<BuildLock> tryLockBuild(const StorePath & drvPath) override;
 
+    /**
+     * Advertise a ready-to-build derivation in the shared `BuildQueue`, so
+     * an idle node may steal it (see the `work-stealing` setting). Handles
+     * form a multiset like the temp-root pins: the first one publishes
+     * synchronously, the heartbeat renews live advertisements, and the last
+     * handle's destruction withdraws the row (a crashed node's ads lapse by
+     * TTL).
+     */
+    std::unique_ptr<BuildAdvertisement> advertiseBuild(const StorePath & drvPath) override;
+
 private:
     void anchor() override;
 
@@ -241,6 +273,21 @@ private:
         the heartbeat renews exactly these paths' temp roots. */
     std::mutex pinsMutex;
     std::map<StorePath, unsigned> pinnedPaths;
+
+    /** Advertised ready-to-build derivations, with handle counts (see
+        `advertiseBuild`). Guarded by `pinsMutex`; renewed by the
+        heartbeat. */
+    std::map<StorePath, unsigned> advertisedBuilds;
+
+    class BuildAd;
+
+    /** Number of builds this node is currently running (live build-lock
+        handles); the work stealer only runs at zero. */
+    std::atomic<unsigned> activeLocalBuilds{0};
+
+    /** Background work stealer (only started with `work-stealing`). */
+    std::thread stealerThread;
+    void stealOne();
 };
 
 } // namespace nix

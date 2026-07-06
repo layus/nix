@@ -213,6 +213,13 @@ void PostgresMetadataBackend::initSchema()
             expires  bigint not null
         );
         create index if not exists IndexBuildLocksHolder on BuildLocks(holder);
+        create table if not exists BuildQueue (
+            drvPath  text primary key,
+            node     text not null,
+            enqueued bigint not null,
+            expires  bigint not null
+        );
+        create index if not exists IndexBuildQueueExpires on BuildQueue(expires);
     )sql";
 
     /* Several nodes may open a brand-new database at the same time. Running the
@@ -704,6 +711,40 @@ void PostgresMetadataBackend::renewBuildLocks(const std::string & holder, uint64
     auto lock = std::scoped_lock(mutex);
     int64_t expires = (int64_t) time(nullptr) + (int64_t) ttlSeconds;
     Result(execParams("update BuildLocks set expires = $1 where holder = $2", {std::to_string(expires), holder}));
+}
+
+void PostgresMetadataBackend::advertiseBuild(const std::string & node, const std::string & drvPath, uint64_t ttlSeconds)
+{
+    auto lock = std::scoped_lock(mutex);
+    int64_t now = (int64_t) time(nullptr);
+    Result(execParams(
+        "insert into BuildQueue (drvPath, node, enqueued, expires) values ($1, $2, $3, $4) "
+        "on conflict (drvPath) do update set node = excluded.node, expires = excluded.expires",
+        {drvPath, node, std::to_string(now), std::to_string(now + (int64_t) ttlSeconds)}));
+}
+
+void PostgresMetadataBackend::unadvertiseBuild(const std::string & drvPath)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result(execParams("delete from BuildQueue where drvPath = $1", {drvPath}));
+}
+
+std::vector<StorePath> PostgresMetadataBackend::queryStealableBuilds(const std::string & node, unsigned limit)
+{
+    auto lock = std::scoped_lock(mutex);
+    auto now = std::to_string((int64_t) time(nullptr));
+    /* Stealable: a live advertisement from another node whose derivation
+       nobody is actually building right now (no live build lock). */
+    Result res(execParams(
+        "select q.drvPath from BuildQueue q "
+        "where q.expires > $1 and q.node <> $2 "
+        "and not exists (select 1 from BuildLocks b where b.drv_path = q.drvPath and b.expires > $1) "
+        "order by q.enqueued limit $3",
+        {now, node, std::to_string(limit)}));
+    std::vector<StorePath> paths;
+    for (int i = 0; i < res.ntuples(); ++i)
+        paths.push_back(store.parseStorePath(res.get(i, 0)));
+    return paths;
 }
 
 } // namespace nix

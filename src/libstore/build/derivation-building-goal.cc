@@ -434,6 +434,14 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
         return LocalBuildCapability{*localStoreP, ext};
     }();
 
+    /* Advertise this ready-to-build derivation cluster-wide, so that an idle
+       node sharing the store may steal it while we wait for a build slot
+       (`nullptr` for non-clustered stores; see `Store::advertiseBuild`).
+       Execution is still arbitrated by the cluster build lock below, and if
+       a stealer builds it first, the validity recheck in `acquireResources`
+       reuses its result. Withdrawn when this goal completes. */
+    [[maybe_unused]] auto buildAdvertisement = worker.store.advertiseBuild(drvPath);
+
     /* A single cluster-wide build lock for this derivation, shared by all the
        build-attempt lambdas below (captured by reference). It is acquired once
        (the first time `acquireResources` runs) and then moved into whichever
@@ -941,6 +949,12 @@ Goal::Co DerivationBuildingGoal::buildLocally(
         unsigned int curBuilds = worker.getNrLocalBuilds();
         if (curBuilds >= worker.settings.maxBuildJobs) {
             outputLocks.unlock();
+            /* Also release the cluster-wide build lock while waiting for a
+               local build slot: holding it would mark this derivation as
+               being built and prevent an idle node from stealing it (see
+               `Store::advertiseBuild`). The restart re-acquires the lock and
+               re-checks output validity, so a stolen result is reused. */
+            buildLock.reset();
             co_await waitForBuildSlot();
             co_return tryToBuild(std::move(inputPaths));
         }

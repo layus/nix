@@ -89,6 +89,9 @@ struct PostgresMetadataBackend : MetadataBackend
     bool acquireBuildLock(const std::string & drvPath, const std::string & holder, uint64_t ttlSeconds) override;
     void releaseBuildLock(const std::string & drvPath, const std::string & holder) override;
     void renewBuildLocks(const std::string & holder, uint64_t ttlSeconds) override;
+    void advertiseBuild(const std::string & node, const std::string & drvPath, uint64_t ttlSeconds) override;
+    void unadvertiseBuild(const std::string & drvPath) override;
+    std::vector<StorePath> queryStealableBuilds(const std::string & node, unsigned limit) override;
 
     /**
      * Record the static output mapping of a derivation.

@@ -284,6 +284,29 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       against a single live node (TTL 5 s): a just-added path survives an
       immediate GC, is reclaimed by a GC after the TTL — no node restart —
       and is reported invalid afterwards.
+- [x] **Work stealing: idle nodes build for busy ones.** A node whose build
+      slots are saturated *advertises* its ready-to-build derivations (all
+      inputs valid) in a shared `BuildQueue` table; an idle node polls for
+      stealable entries — live advertisements from other nodes with no live
+      build lock — and simply builds them. The per-derivation `BuildLocks`
+      still arbitrate execution, so duplicate builds are impossible by
+      construction, and the advertiser's goal absorbs a stolen result through
+      its existing lock-wait → validity-recheck path ("someone beat us to
+      it"). Plumbing: a `Store::advertiseBuild` seam (RAII handle, default
+      `nullptr`) held by the build goal for `tryToBuild`'s duration;
+      advertisements form a heartbeat-renewed multiset like the temp-root
+      pins (a crashed advertiser's entries lapse by TTL); a `work-stealing`
+      setting (default off — pure clients must not build) with a
+      `work-stealing-interval` poll period; idleness = no live build-lock
+      handles on the node. Stolen builds run through the normal local build
+      machinery (`buildPaths`), so substitution, sandboxing, and registration
+      all behave as usual. Validated by `simple-test.sh`: with `max-jobs = 1`
+      and two slow deps fired at node1 only, node2 steals and builds one.
+- [ ] Work-stealing refinements: steal more than one derivation at a time on
+      multi-slot nodes; count remote (RPC-initiated) builds toward idleness;
+      stolen-build log lines currently go to the stealer's server log (and
+      can interleave into a concurrent RPC build's stream, since the logger
+      is process-global).
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).

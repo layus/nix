@@ -61,16 +61,23 @@ struct DistributedBuildLock : BuildLock
     MetadataBackend * backend;
     std::string drvPath;
     std::string holder;
+    /* Live locks double as this node's active-build count, which gates the
+       work stealer (an idle node has none). */
+    std::atomic<unsigned> * activeBuilds;
 
-    DistributedBuildLock(MetadataBackend * backend, std::string drvPath, std::string holder)
+    DistributedBuildLock(
+        MetadataBackend * backend, std::string drvPath, std::string holder, std::atomic<unsigned> * activeBuilds)
         : backend(backend)
         , drvPath(std::move(drvPath))
         , holder(std::move(holder))
+        , activeBuilds(activeBuilds)
     {
+        ++*activeBuilds;
     }
 
     ~DistributedBuildLock() override
     {
+        --*activeBuilds;
         try {
             backend->releaseBuildLock(drvPath, holder);
         } catch (...) {
@@ -160,6 +167,8 @@ DistributedStore::DistributedStore(ref<const Config> config)
                     std::lock_guard<std::mutex> pinsLk(pinsMutex);
                     for (auto & [path, _count] : pinnedPaths)
                         backend->addTempRoot(nodeId, path, tempRootTtlSeconds());
+                    for (auto & [drv, _count] : advertisedBuilds)
+                        backend->advertiseBuild(nodeId, printStorePath(drv), tempRootTtlSeconds());
                 }
                 backend->renewBuildLocks(nodeId, buildLockTtlSeconds);
             } catch (...) {
@@ -168,6 +177,27 @@ DistributedStore::DistributedStore(ref<const Config> config)
             lk.lock();
         }
     });
+
+    /* Steal advertised builds from busier nodes while this one is idle. */
+    if (config->workStealing)
+        stealerThread = std::thread([this]() {
+            std::unique_lock<std::mutex> lk(heartbeatMutex);
+            while (!heartbeatStop) {
+                if (heartbeatCv.wait_for(lk, std::chrono::seconds(this->config->workStealingInterval), [this]() {
+                        return heartbeatStop;
+                    }))
+                    break;
+                lk.unlock();
+                try {
+                    stealOne();
+                } catch (std::exception & e) {
+                    /* The advertiser still owns the goal and will build (or
+                       properly fail) it itself; just report. */
+                    printError("work stealing failed: %s", e.what());
+                }
+                lk.lock();
+            }
+        });
 }
 
 DistributedStore::~DistributedStore()
@@ -179,6 +209,8 @@ DistributedStore::~DistributedStore()
     heartbeatCv.notify_all();
     if (heartbeatThread.joinable())
         heartbeatThread.join();
+    if (stealerThread.joinable())
+        stealerThread.join();
     /* Release this node's temp roots on clean shutdown (as LocalStore's
        lapse with the client connection); the TTL only bounds a crash. */
     try {
@@ -655,7 +687,69 @@ std::unique_ptr<BuildLock> DistributedStore::tryLockBuild(const StorePath & drvP
     auto drv = printStorePath(drvPath);
     if (!backend->acquireBuildLock(drv, nodeId, buildLockTtlSeconds))
         return nullptr; // another node is building this derivation
-    return std::make_unique<DistributedBuildLock>(backend.get(), std::move(drv), nodeId);
+    return std::make_unique<DistributedBuildLock>(backend.get(), std::move(drv), nodeId, &activeLocalBuilds);
+}
+
+/* ------------------------------------------------------------------ *
+ * Work stealing
+ * ------------------------------------------------------------------ */
+
+class DistributedStore::BuildAd : public BuildAdvertisement
+{
+    DistributedStore & store;
+    StorePath drvPath;
+
+public:
+    BuildAd(DistributedStore & store_, const StorePath & drvPath_)
+        : store(store_)
+        , drvPath(drvPath_)
+    {
+        std::lock_guard<std::mutex> lk(store.pinsMutex);
+        if (store.advertisedBuilds[drvPath]++ == 0)
+            /* First advertisement: publish synchronously; renewed by the
+               heartbeat while any handle is alive. */
+            store.backend->advertiseBuild(store.nodeId, store.printStorePath(drvPath), tempRootTtlSeconds());
+    }
+
+    ~BuildAd() override
+    {
+        std::lock_guard<std::mutex> lk(store.pinsMutex);
+        auto it = store.advertisedBuilds.find(drvPath);
+        if (it != store.advertisedBuilds.end() && --it->second == 0) {
+            store.advertisedBuilds.erase(it);
+            try {
+                store.backend->unadvertiseBuild(store.printStorePath(drvPath));
+            } catch (...) {
+                ignoreExceptionInDestructor(); // the TTL reclaims it
+            }
+        }
+    }
+};
+
+std::unique_ptr<BuildAdvertisement> DistributedStore::advertiseBuild(const StorePath & drvPath)
+{
+    return std::make_unique<BuildAd>(*this, drvPath);
+}
+
+void DistributedStore::stealOne()
+{
+    /* Only steal when this node is otherwise idle. */
+    if (activeLocalBuilds.load() > 0)
+        return;
+    auto candidates = backend->queryStealableBuilds(nodeId, 1);
+    if (candidates.empty())
+        return;
+    auto & drvPath = candidates.front();
+    /* The .drv must have reached the shared store (the advertiser built or
+       imported it there); otherwise leave it to its advertiser. */
+    if (!isValidPath(drvPath))
+        return;
+    printInfo("work stealing: building '%s'", printStorePath(drvPath));
+    buildPaths({DerivedPath::Built{
+        .drvPath = makeConstantStorePathRef(drvPath),
+        .outputs = OutputsSpec::All{},
+    }});
+    printInfo("work stealing: built '%s'", printStorePath(drvPath));
 }
 
 static RegisterStoreImplementation<DistributedStore::Config> regDistributedStore;

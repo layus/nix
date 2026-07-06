@@ -132,6 +132,22 @@ create table if not exists BuildLocks (
 
 create index if not exists IndexBuildLocksHolder on BuildLocks(holder);
 
+-- Ready-to-build derivations advertised for WORK STEALING. A node whose build
+-- slots are saturated advertises derivations that are ready to build (inputs
+-- all valid); an idle node may steal one and build it. Actual execution is
+-- still arbitrated by BuildLocks, so advertising is always safe (duplicates
+-- are impossible) and a stealable entry is one with no live build lock.
+-- Advertisements are renewed by the advertiser's heartbeat and withdrawn when
+-- its goal completes; `expires` bounds a crashed advertiser.
+create table if not exists BuildQueue (
+    drvPath  text primary key,
+    node     text not null,                        -- advertising node
+    enqueued bigint not null,                      -- epoch seconds of first advertisement
+    expires  bigint not null                       -- epoch seconds when the ad lapses
+);
+
+create index if not exists IndexBuildQueueExpires on BuildQueue(expires);
+
 -- Schema-initialisation coordination. When several nodes open a brand-new
 -- database at once, running the DDL above from all of them races (the database
 -- rejects concurrent CREATE TABLEs). Instead this single tiny table is created

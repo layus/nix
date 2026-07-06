@@ -253,6 +253,26 @@ struct MetadataBackend
      * `ttlSeconds` (the heartbeat), so a long build does not lose its lock.
      */
     virtual void renewBuildLocks(const std::string & holder, uint64_t ttlSeconds) = 0;
+
+    /**
+     * Advertise `drvPath` as ready to build (all of its inputs are valid),
+     * so that an idle node may steal and build it; valid for `ttlSeconds`.
+     * Upsert: re-advertising pushes the expiry forward (the advertiser's
+     * heartbeat).
+     */
+    virtual void advertiseBuild(const std::string & node, const std::string & drvPath, uint64_t ttlSeconds) = 0;
+
+    /**
+     * Withdraw an advertisement (no-op if absent).
+     */
+    virtual void unadvertiseBuild(const std::string & drvPath) = 0;
+
+    /**
+     * Up to `limit` stealable builds: non-expired advertisements from nodes
+     * OTHER than `node` whose derivation has no live build lock (nobody is
+     * actually building it right now), oldest first.
+     */
+    virtual std::vector<StorePath> queryStealableBuilds(const std::string & node, unsigned limit) = 0;
 };
 
 } // namespace nix

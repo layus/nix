@@ -115,7 +115,9 @@ echo "   CockroachDB ready, database '$DB' created"
 
 DBURL="postgresql://root@cockroach:26257/$DB"
 # The share is mounted at /cluster; the store lives in its /store subdir.
-BACKING="distributed://?metadata-db-url=$DBURL&real=/cluster/store&gc-root-lifetime=$ROOT_LIFETIME"
+# work-stealing: idle nodes poll (every 1s here) for builds advertised by
+# saturated nodes and build them, arbitrated by the per-drv build lock.
+BACKING="distributed://?metadata-db-url=$DBURL&real=/cluster/store&gc-root-lifetime=$ROOT_LIFETIME&work-stealing=true&work-stealing-interval=1"
 
 # ---------------------------------------------------------------------------
 # node helpers (same recipe as stress-test.sh, share mounted at /cluster)
@@ -165,11 +167,13 @@ mount_share() {
 
 launch_server() {
   local name=$1
+  # max-jobs = 1 so a node saturates with a single build, making work
+  # stealing observable (a second ready derivation goes to the other node).
   docker exec "$name" sh -c "printf '%s\n' \
     'build-users-group = nixbld' \
     'sandbox = true' \
     'builders =' \
-    'max-jobs = $NIXBLD_N' \
+    'max-jobs = 1' \
     'experimental-features = nix-command flakes' > /tmp/nix.conf"
   # The advertised address (4th arg) is what the server registers in the
   # share's /var/replicas registry for clients to discover.
@@ -325,6 +329,49 @@ if "${nix_cmd[@]}" path-info --store "$CLUSTER" "$OUT" >/dev/null 2>&1; then
   echo "   OK: path valid via grpc://?registry=... (no static node list)"
 else
   echo "!!! path-info via the registry-discovering cluster URI failed"; fail=1
+fi
+
+# ---------------------------------------------------------------------------
+# work stealing: an idle node2 must pick up node1's queued builds
+# ---------------------------------------------------------------------------
+echo
+echo "== work stealing (node1 saturated at max-jobs=1 with two slow deps) =="
+SEXPR=$(cat <<'NIXEXPR'
+let dep = n: derivation {
+  name = "steal-dep-${n}";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "j=0; while [ $j -lt 20000000 ]; do j=$((j+1)); done; echo ${n} > $out" ];
+}; in builtins.unsafeDiscardStringContext (derivation {
+  name = "steal-top";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  depA = dep "a";
+  depB = dep "b";
+  args = [ "-c" "test -e $depA -a -e $depB || exit 1; echo done > $out" ];
+}).drvPath
+NIXEXPR
+)
+SDRV=$("${nix_cmd[@]}" eval --raw --impure --expr "$SEXPR")
+SOUT=$(set +o pipefail; "${nix_cmd[@]}" derivation show "$SDRV" 2>/dev/null \
+         | grep -oE '/nix/store/[a-z0-9]{32}-[^"]+' | grep -v '\.drv"\?$' | head -1)
+"${nix_cmd[@]}" copy --no-check-sigs --derivation --to "$N1" "$SDRV" >/dev/null 2>&1
+# Fire at node1 ONLY: it builds one dep (its single slot), advertises the
+# other, and the idle node2 must steal it.
+timeout "$BUILD_TIMEOUT" "${nix_cmd[@]}" build --no-link --store "$N1" "$SDRV^*" \
+  >/tmp/simple-steal.out 2>/tmp/simple-steal.err || true
+if "${nix_cmd[@]}" path-info --store "$N2" "$SOUT" >/dev/null 2>&1; then
+  echo "   OK: the full closure built and is valid cluster-wide"
+else
+  echo "!!! steal-top output not valid:"; tail -n 10 /tmp/simple-steal.err; fail=1
+fi
+stolen=$(docker exec node2 grep -c 'work stealing: built' /tmp/server.log 2>/dev/null || true)
+if [ "${stolen:-0}" -ge 1 ] 2>/dev/null; then
+  echo "   OK: node2 stole and built $stolen derivation(s):"
+  docker exec node2 grep 'work stealing: built' /tmp/server.log | sed 's/^/      /'
+else
+  echo "!!! node2 stole nothing; node2 log tail:"
+  docker exec node2 tail -n 10 /tmp/server.log; fail=1
 fi
 
 # ---------------------------------------------------------------------------

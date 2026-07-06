@@ -398,6 +398,17 @@ struct BuildLock
     virtual ~BuildLock() = default;
 };
 
+/**
+ * An opaque handle to a cluster-wide advertisement that a derivation is
+ * ready to build, so that an idle node sharing the store may steal the work
+ * (see `Store::advertiseBuild`). Destroying the handle withdraws the
+ * advertisement.
+ */
+struct BuildAdvertisement
+{
+    virtual ~BuildAdvertisement() = default;
+};
+
 class Store : public std::enable_shared_from_this<Store>, public StoreDirConfig
 {
     /* VTable anchor to avoid weak linkage of the vtable - it breaks
@@ -783,6 +794,19 @@ public:
     virtual std::unique_ptr<BuildLock> tryLockBuild(const StorePath & drvPath)
     {
         return std::make_unique<BuildLock>();
+    }
+
+    /**
+     * Advertise that the derivation `drvPath` is ready to build (its inputs
+     * are all valid), so that on stores shared by a cluster an idle node may
+     * steal and build it while this one is out of build slots. Execution is
+     * still arbitrated by `tryLockBuild`, so advertising is always safe.
+     * Returns a handle that withdraws the advertisement when destroyed, or
+     * `nullptr` for stores without cross-node work stealing (the default).
+     */
+    virtual std::unique_ptr<BuildAdvertisement> advertiseBuild(const StorePath & drvPath)
+    {
+        return nullptr;
     }
 
     /**
