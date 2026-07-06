@@ -452,13 +452,20 @@ struct GrpcStore : virtual Store, virtual GcStore
                         auto built = resolveDerivedPath(*this, bfd, evalStore.get());
                         for (auto & [output, outputPath] : built) {
                             auto outputId = DrvOutput{drvPath, output};
+                            /* Prefer a registered realisation (it carries
+                               signatures), but don't require one: a server
+                               without the CA feature never registers any for
+                               input-addressed builds. The output path was
+                               resolved above either way (a genuinely unbuilt
+                               CA derivation already threw there), so it is
+                               safe to report. */
                             if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
-                                auto realisation = queryRealisation(outputId);
-                                if (!realisation)
-                                    throw MissingRealisation(*this, outputId);
-                                success.builtOutputs.emplace(output, *realisation);
-                            } else
-                                success.builtOutputs.emplace(output, UnkeyedRealisation{.outPath = outputPath});
+                                if (auto realisation = queryRealisation(outputId)) {
+                                    success.builtOutputs.emplace(output, *realisation);
+                                    continue;
+                                }
+                            }
+                            success.builtOutputs.emplace(output, UnkeyedRealisation{.outPath = outputPath});
                         }
                         results.push_back(KeyedBuildResult{{.inner = std::move(success)}, bfd});
                     }},
