@@ -92,6 +92,9 @@ struct PostgresMetadataBackend : MetadataBackend
     void advertiseBuild(const std::string & node, const std::string & drvPath, uint64_t ttlSeconds) override;
     void unadvertiseBuild(const std::string & drvPath) override;
     std::vector<StorePath> queryStealableBuilds(const std::string & node, unsigned limit) override;
+    void clearBuildLog(const std::string & drvPath) override;
+    void appendBuildLog(const std::string & drvPath, uint64_t seq, std::string_view data, bool final) override;
+    std::vector<BuildLogChunk> readBuildLog(const std::string & drvPath, uint64_t fromSeq) override;
 
     /**
      * Record the static output mapping of a derivation.

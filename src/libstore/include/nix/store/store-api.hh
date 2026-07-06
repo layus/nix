@@ -409,6 +409,20 @@ struct BuildAdvertisement
     virtual ~BuildAdvertisement() = default;
 };
 
+/**
+ * Follows the build log of a derivation being built by ANOTHER worker of a
+ * shared store (see `Store::followBuildLog`): each `poll()` emits the log
+ * lines that appeared since the last one through the logger, so a client
+ * waiting on the cluster build lock streams the same log the builder's own
+ * client sees.
+ */
+struct BuildLogFollower
+{
+    virtual ~BuildLogFollower() = default;
+
+    virtual void poll() = 0;
+};
+
 class Store : public std::enable_shared_from_this<Store>, public StoreDirConfig
 {
     /* VTable anchor to avoid weak linkage of the vtable - it breaks
@@ -820,6 +834,32 @@ public:
     virtual bool useFileSystemBuildLocks()
     {
         return true;
+    }
+
+    /**
+     * A sink that records the (uncompressed) build log of `drvPath`
+     * somewhere every worker and client of this store can read it back —
+     * e.g. a replicated database — in addition to the machine-local log
+     * file. This is what makes `followBuildLog` and cluster-wide `nix log`
+     * possible. Returns `nullptr` for stores that only keep the local log
+     * file (the default). The sink's `finish()` marks the log complete.
+     */
+    virtual std::shared_ptr<FinishSink> buildLogSink(const StorePath & drvPath)
+    {
+        return nullptr;
+    }
+
+    /**
+     * Follow the build log another worker of this store is currently
+     * recording for `drvPath` (via `buildLogSink`), e.g. while waiting on
+     * its `tryLockBuild` lock: each `poll()` re-emits the new lines through
+     * the logger, so every requester of a build sees its log, not just the
+     * one whose worker won the build lock. Returns `nullptr` when the store
+     * cannot follow logs (the default).
+     */
+    virtual std::unique_ptr<BuildLogFollower> followBuildLog(const StorePath & drvPath)
+    {
+        return nullptr;
     }
 
     /**

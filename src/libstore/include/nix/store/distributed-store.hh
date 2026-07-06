@@ -179,7 +179,14 @@ struct DistributedStore : virtual LocalStore
      */
     bool verifyStore(bool checkContents, RepairFlag repair) override;
 
-    /* --- build logs: not yet implemented --- */
+    /* --- build logs: recorded in the shared database, chunk by chunk, so
+       every worker and client can read (and follow) them --- */
+    /** Tees a build's raw log into the shared `BuildLogs` table. */
+    std::shared_ptr<FinishSink> buildLogSink(const StorePath & drvPath) override;
+    /** Streams another worker's in-progress log from `BuildLogs` (used
+        while waiting on its build lock, so every requester sees the log). */
+    std::unique_ptr<BuildLogFollower> followBuildLog(const StorePath & drvPath) override;
+    /** Serves `nix log` from `BuildLogs`, cluster-wide. */
     std::optional<std::string> getBuildLogExact(const StorePath & path) override;
     void addBuildLog(const StorePath & path, std::string_view log) override;
 

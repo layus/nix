@@ -308,6 +308,29 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       alike — because the build-lock handles that drive the counter are taken
       by every local build. The stress test now runs with work stealing
       enabled and reports per-node steal counts.
+- [x] **Flock replaced by replicated-database locks.** Build-lock holders
+      are unique per acquisition (`nodeId#token`, heartbeat-renewed by
+      prefix), closing the same-node double-build hole; the build goal skips
+      the machine-local flock output locks for stores whose `tryLockBuild`
+      provides full exclusion (`Store::useFileSystemBuildLocks`, false for
+      the distributed store — flock is unreliable on NFS anyway); and
+      `addToStore`/`addToStoreFromDump` take database leases on the
+      destination path instead of flocking it over NFS.
+- [x] **Build logs in the shared database, streamed to every requester.**
+      The building worker tees its raw log into a `BuildLogs` chunk table
+      (`Store::buildLogSink`, 32 KiB chunks flushed at least once a second);
+      a worker waiting on the derivation's build lock *follows* the chunks
+      (`Store::followBuildLog`) and re-emits complete lines as
+      `resBuildLogLine` under a build activity — so two clients requesting
+      the same build each stream its log (previously the loser just waited
+      silently on the lock), rendered identically to a local build. `nix log
+      --store distributed://…` is served from the same rows on any node
+      (`getBuildLogExact`), logs are deleted with their derivation at GC,
+      and the chunks are opaque bytes (plain builder output; a structured
+      format such as protobuf JSON would need no schema change). Validated:
+      the same slow derivation fired at both nodes shows the builder's
+      marker lines in BOTH clients' output, and `nix log` returns the stored
+      log.
 - [ ] Stolen-build log lines go to the stealer's server log and can
       interleave into a concurrent RPC build's stream (the logger is
       process-global).

@@ -8,7 +8,10 @@
 #  include "nix/util/signature/local-keys.hh"
 #  include "nix/util/topo-sort.hh"
 #  include "nix/util/hash.hh"
+#  include "nix/util/base-n.hh"
 #  include "nix/store/content-address.hh"
+
+#  include <span>
 
 #  include <libpq-fe.h>
 
@@ -220,6 +223,13 @@ void PostgresMetadataBackend::initSchema()
             expires  bigint not null
         );
         create index if not exists IndexBuildQueueExpires on BuildQueue(expires);
+        create table if not exists BuildLogs (
+            drvPath text not null,
+            seq     bigint not null,
+            chunk   bytea not null,
+            final   boolean not null default false,
+            primary key (drvPath, seq)
+        );
     )sql";
 
     /* Several nodes may open a brand-new database at the same time. Running the
@@ -614,8 +624,12 @@ void PostgresMetadataBackend::removeValidPaths(const StorePathSet & paths)
         auto ps = store.printStorePath(p);
         Result(execParams("delete from Refs where referrer = $1 or reference = $1", {ps}));
     }
-    for (auto & p : paths)
-        Result(execParams("delete from ValidPaths where path = $1", {store.printStorePath(p)}));
+    for (auto & p : paths) {
+        auto ps = store.printStorePath(p);
+        Result(execParams("delete from ValidPaths where path = $1", {ps}));
+        /* A derivation's stored build log goes with it. */
+        Result(execParams("delete from BuildLogs where drvPath = $1", {ps}));
+    }
     txn.commit();
 }
 
@@ -732,6 +746,45 @@ void PostgresMetadataBackend::unadvertiseBuild(const std::string & drvPath)
 {
     auto lock = std::scoped_lock(mutex);
     Result(execParams("delete from BuildQueue where drvPath = $1", {drvPath}));
+}
+
+void PostgresMetadataBackend::clearBuildLog(const std::string & drvPath)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result(execParams("delete from BuildLogs where drvPath = $1", {drvPath}));
+}
+
+void PostgresMetadataBackend::appendBuildLog(
+    const std::string & drvPath, uint64_t seq, std::string_view data, bool final)
+{
+    auto lock = std::scoped_lock(mutex);
+    /* The chunk is arbitrary bytes; ship it base64 through the text protocol. */
+    Result(execParams(
+        "insert into BuildLogs (drvPath, seq, chunk, final) values ($1, $2, decode($3, 'base64'), $4) "
+        "on conflict (drvPath, seq) do nothing",
+        {drvPath,
+         std::to_string(seq),
+         base64::encode(std::as_bytes(std::span(data.data(), data.size()))),
+         final ? "true" : "false"}));
+}
+
+std::vector<MetadataBackend::BuildLogChunk>
+PostgresMetadataBackend::readBuildLog(const std::string & drvPath, uint64_t fromSeq)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result res(execParams(
+        "select seq, encode(chunk, 'base64'), final from BuildLogs where drvPath = $1 and seq >= $2 order by seq",
+        {drvPath, std::to_string(fromSeq)}));
+    std::vector<BuildLogChunk> chunks;
+    for (int i = 0; i < res.ntuples(); ++i) {
+        std::string_view fin = res.get(i, 2);
+        chunks.push_back({
+            .seq = (uint64_t) std::stoull(res.get(i, 0)),
+            .data = base64::decode(res.get(i, 1)),
+            .final = fin == "t" || fin == "true",
+        });
+    }
+    return chunks;
 }
 
 std::vector<StorePath> PostgresMetadataBackend::queryStealableBuilds(const std::string & node, unsigned limit)

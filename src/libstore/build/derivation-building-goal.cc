@@ -252,7 +252,10 @@ Goal::Co DerivationBuildingGoal::gaveUpOnSubstitution(bool storeDerivation)
 struct LogFile
 {
     AutoCloseFD fd;
-    std::shared_ptr<BufferedSink> fileSink, sink;
+    std::shared_ptr<BufferedSink> fileSink;
+    /* The chain writes go through: [tee to the store's shared log sink →]
+       [compression →] fileSink. */
+    std::shared_ptr<Sink> sink;
 
     LogFile(Store & store, const StorePath & drvPath, const LogFileSettings & logSettings);
     ~LogFile();
@@ -508,10 +511,27 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
 
            Acquire once and keep it: `acquireResources` can run again for the
            same goal (e.g. the hook declines and we fall back to a local build),
-           and re-acquiring would drop and retake the lock. */
+           and re-acquiring would drop and retake the lock.
+
+           While another worker holds the lock, FOLLOW its build log (stores
+           that record logs in shared storage support this, see
+           `Store::followBuildLog`): every requester of a build sees its log
+           as it happens, not just the one whose worker won the lock. One
+           last poll after acquiring drains the tail — the winner completes
+           its log before releasing the lock. */
+        std::unique_ptr<BuildLogFollower> logFollower;
         while (!buildLock)
-            if (!(buildLock = worker.store.tryLockBuild(drvPath)))
+            if (!(buildLock = worker.store.tryLockBuild(drvPath))) {
+                if (!logFollower)
+                    logFollower = worker.store.followBuildLog(drvPath);
+                if (logFollower)
+                    logFollower->poll();
                 co_await waitForAWhile();
+            }
+        if (logFollower) {
+            logFollower->poll();
+            logFollower.reset();
+        }
 
         /* Now check again whether the outputs are valid.  This is because
            another process may have started building in parallel.  After
@@ -1338,13 +1358,41 @@ LogFile::LogFile(Store & store, const StorePath & drvPath, const LogFileSettings
         sink = std::shared_ptr<CompressionSink>(makeCompressionSink(CompressionAlgo::bzip2, *fileSink));
     else
         sink = fileSink;
+
+    /* Stores shared by several workers may record the (uncompressed) log
+       somewhere every worker can read it back — e.g. a replicated database —
+       so other requesters of this same build can stream it too (see
+       Store::buildLogSink). Tee into that sink alongside the local file. */
+    if (auto shared = store.buildLogSink(drvPath)) {
+        struct TeeFinishSink : FinishSink
+        {
+            std::shared_ptr<Sink> main;
+            std::shared_ptr<FinishSink> extra;
+
+            void operator()(std::string_view data) override
+            {
+                (*main)(data);
+                (*extra)(data);
+            }
+
+            void finish() override
+            {
+                if (auto f = std::dynamic_pointer_cast<FinishSink>(main))
+                    f->finish();
+                extra->finish();
+            }
+        };
+        auto tee = std::make_shared<TeeFinishSink>();
+        tee->main = sink;
+        tee->extra = shared;
+        sink = tee;
+    }
 }
 
 LogFile::~LogFile()
 {
     try {
-        auto sink2 = std::dynamic_pointer_cast<CompressionSink>(sink);
-        if (sink2)
+        if (auto sink2 = std::dynamic_pointer_cast<FinishSink>(sink))
             sink2->finish();
         if (fileSink)
             fileSink->flush();

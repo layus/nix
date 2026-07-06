@@ -275,6 +275,39 @@ struct MetadataBackend
      * actually building it right now), oldest first.
      */
     virtual std::vector<StorePath> queryStealableBuilds(const std::string & node, unsigned limit) = 0;
+
+    /* ------------------------------------------------------------------ *
+     * Build logs (cluster-shared, streamed in chunks)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * One stored chunk of a derivation's build log.
+     */
+    struct BuildLogChunk
+    {
+        uint64_t seq;
+        std::string data;
+        bool final;
+    };
+
+    /**
+     * Delete any stored log of `drvPath` (called before a rebuild starts
+     * recording a fresh one).
+     */
+    virtual void clearBuildLog(const std::string & drvPath) = 0;
+
+    /**
+     * Append chunk number `seq` of `drvPath`'s build log; `final` marks the
+     * last one.
+     */
+    virtual void appendBuildLog(const std::string & drvPath, uint64_t seq, std::string_view data, bool final) = 0;
+
+    /**
+     * The stored chunks of `drvPath`'s log with `seq >= fromSeq`, in order.
+     * Used both to follow a log as it is being written (poll with a moving
+     * `fromSeq`) and to read a complete one.
+     */
+    virtual std::vector<BuildLogChunk> readBuildLog(const std::string & drvPath, uint64_t fromSeq) = 0;
 };
 
 } // namespace nix

@@ -379,6 +379,47 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# shared build logs: EVERY requester streams the log; nix log served from DB
+# ---------------------------------------------------------------------------
+echo
+echo "== shared build logs (same drv fired at both nodes; both must see the log) =="
+LEXPR=$(cat <<'NIXEXPR'
+builtins.unsafeDiscardStringContext (derivation {
+  name = "logshare";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "echo logshare-marker-alpha; echo logshare-marker-beta; j=0; while [ $j -lt 20000000 ]; do j=$((j+1)); done; echo done > $out" ];
+}).drvPath
+NIXEXPR
+)
+LDRV=$("${nix_cmd[@]}" eval --raw --impure --expr "$LEXPR")
+"${nix_cmd[@]}" copy --no-check-sigs --derivation --to "$N1" "$LDRV" >/dev/null 2>&1
+"${nix_cmd[@]}" copy --no-check-sigs --derivation --to "$N2" "$LDRV" >/dev/null 2>&1
+# Fire at BOTH nodes at once: one worker wins the build lock and builds; the
+# other waits on the lock and must FOLLOW the winner's log from the shared DB.
+( timeout "$BUILD_TIMEOUT" "${nix_cmd[@]}" build --no-link -L --store "$N1" "$LDRV^*" \
+    >/dev/null 2>/tmp/simple-log-1.err ) & lpid1=$!
+( timeout "$BUILD_TIMEOUT" "${nix_cmd[@]}" build --no-link -L --store "$N2" "$LDRV^*" \
+    >/dev/null 2>/tmp/simple-log-2.err ) & lpid2=$!
+wait "$lpid1" || true
+wait "$lpid2" || true
+for c in 1 2; do
+  if grep -q 'logshare-marker-alpha' /tmp/simple-log-$c.err; then
+    echo "   OK: client $c saw the builder's log lines"
+  else
+    echo "!!! client $c did not see the log; its stderr tail:"
+    tail -n 8 /tmp/simple-log-$c.err; fail=1
+  fi
+done
+# nix log serves the stored log from the database, on any node.
+if docker exec node1 sh -c "PATH=/build/src/nix:\$PATH nix --extra-experimental-features nix-command log --store '$BACKING' '$LDRV' 2>/dev/null" \
+     | grep -q 'logshare-marker-beta'; then
+  echo "   OK: nix log serves the stored log from the shared DB"
+else
+  echo "!!! nix log did not return the stored log"; fail=1
+fi
+
+# ---------------------------------------------------------------------------
 # GC roots are leases: registered remotely, refreshed on re-add, expired by GC
 # ---------------------------------------------------------------------------
 echo

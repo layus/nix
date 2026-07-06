@@ -631,9 +631,139 @@ bool DistributedStore::verifyStore(bool checkContents, RepairFlag repair)
     return errors;
 }
 
-std::optional<std::string> DistributedStore::getBuildLogExact(const StorePath &)
+/* ------------------------------------------------------------------ *
+ * Build logs (cluster-shared)
+ * ------------------------------------------------------------------ */
+
+namespace {
+
+/* Buffers a build's raw log and appends it to the shared database in ordered
+   chunks: bounded in size to keep the row count sane, but flushed at least
+   once a second so followers see lines promptly. finish() sends the terminal
+   chunk. (The chunks are plain builder output; a structured format such as
+   protobuf JSON could replace it without touching the schema.) */
+struct DbBuildLogSink : FinishSink
 {
-    return std::nullopt;
+    MetadataBackend & backend;
+    std::string drvPath;
+    uint64_t seq = 0;
+    std::string buf;
+    std::chrono::steady_clock::time_point lastFlush = std::chrono::steady_clock::now();
+    bool finished = false;
+
+    static constexpr size_t maxChunk = 32 * 1024;
+
+    DbBuildLogSink(MetadataBackend & backend, std::string drvPath_)
+        : backend(backend)
+        , drvPath(std::move(drvPath_))
+    {
+        /* A rebuild records a fresh log. */
+        backend.clearBuildLog(drvPath);
+    }
+
+    void operator()(std::string_view data) override
+    {
+        buf.append(data);
+        if (buf.size() >= maxChunk || std::chrono::steady_clock::now() - lastFlush > std::chrono::seconds(1))
+            flushChunk(false);
+    }
+
+    void flushChunk(bool final)
+    {
+        if (buf.empty() && !final)
+            return;
+        backend.appendBuildLog(drvPath, seq++, buf, final);
+        buf.clear();
+        lastFlush = std::chrono::steady_clock::now();
+    }
+
+    void finish() override
+    {
+        if (finished)
+            return;
+        finished = true;
+        flushChunk(true);
+    }
+
+    ~DbBuildLogSink()
+    {
+        try {
+            finish();
+        } catch (...) {
+            ignoreExceptionInDestructor();
+        }
+    }
+};
+
+/* Re-emits a shared build log as it grows: each poll fetches the chunks that
+   appeared since the last one and emits the complete lines as
+   resBuildLogLine under a build activity, so the waiting client renders them
+   exactly like a local build's log. */
+struct DbBuildLogFollower : BuildLogFollower
+{
+    MetadataBackend & backend;
+    std::string drvPath;
+    uint64_t next = 0;
+    std::string pending; // trailing partial line
+    std::optional<Activity> act;
+
+    DbBuildLogFollower(MetadataBackend & backend, std::string drvPath)
+        : backend(backend)
+        , drvPath(std::move(drvPath))
+    {
+    }
+
+    void poll() override
+    {
+        for (auto & chunk : backend.readBuildLog(drvPath, next)) {
+            next = chunk.seq + 1;
+            pending.append(chunk.data);
+            if (chunk.final && !pending.empty() && pending.back() != '\n')
+                pending.push_back('\n');
+        }
+        size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos) {
+            emitLine(pending.substr(0, pos));
+            pending.erase(0, pos + 1);
+        }
+    }
+
+    void emitLine(const std::string & line)
+    {
+        if (!act)
+            act.emplace(
+                *logger,
+                lvlInfo,
+                actBuild,
+                fmt("following build of '%s' on another worker", drvPath),
+                Logger::Fields{drvPath, "", 1, 1});
+        act->result(resBuildLogLine, line);
+    }
+};
+
+} // namespace
+
+std::shared_ptr<FinishSink> DistributedStore::buildLogSink(const StorePath & drvPath)
+{
+    return std::make_shared<DbBuildLogSink>(*backend, printStorePath(drvPath));
+}
+
+std::unique_ptr<BuildLogFollower> DistributedStore::followBuildLog(const StorePath & drvPath)
+{
+    return std::make_unique<DbBuildLogFollower>(*backend, printStorePath(drvPath));
+}
+
+std::optional<std::string> DistributedStore::getBuildLogExact(const StorePath & path)
+{
+    std::string log;
+    bool any = false;
+    for (auto & chunk : backend->readBuildLog(printStorePath(path), 0)) {
+        any = true;
+        log += chunk.data;
+    }
+    if (!any)
+        return std::nullopt;
+    return log;
 }
 
 void DistributedStore::addBuildLog(const StorePath &, std::string_view)

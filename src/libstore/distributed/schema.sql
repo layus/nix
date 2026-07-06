@@ -152,6 +152,22 @@ create table if not exists BuildQueue (
 
 create index if not exists IndexBuildQueueExpires on BuildQueue(expires);
 
+-- Build logs, shared across the whole cluster. The worker building a
+-- derivation tees its (uncompressed) log into here in ordered chunks as it
+-- goes; a worker waiting on the derivation's build lock follows the chunks
+-- and streams them to its own client, so every requester of a build sees its
+-- log, and `nix log` works from any node. `final` marks the last chunk. The
+-- chunks are opaque bytes (the plain builder output for now; a structured
+-- format, e.g. protobuf JSON, could replace it without a schema change).
+-- Rows are deleted with their derivation when it is garbage-collected.
+create table if not exists BuildLogs (
+    drvPath text not null,
+    seq     bigint not null,                       -- chunk index, from 0
+    chunk   bytea not null,
+    final   boolean not null default false,
+    primary key (drvPath, seq)
+);
+
 -- Schema-initialisation coordination. When several nodes open a brand-new
 -- database at once, running the DDL above from all of them races (the database
 -- rejects concurrent CREATE TABLEs). Instead this single tiny table is created
