@@ -15,6 +15,7 @@
 #  include "nix/util/file-content-address.hh"
 #  include "nix/util/file-system.hh"
 #  include "nix/util/environment-variables.hh"
+#  include "nix/util/signals.hh"
 
 #  include "nix-store.grpc.pb.h"
 
@@ -122,15 +123,29 @@ struct GrpcLogger : Logger
     }
 };
 
-/* Run `body`, translating Nix exceptions into a gRPC error status. */
+/* Run `body`, translating Nix exceptions into a gRPC error status: the code
+   reflects the error's nature (so clients and middleboxes can reason about
+   it) and the structured error rides in `error_details` as errorToJson JSON
+   (so the client rethrows with message, traces, and exit status intact). */
 template<typename F>
 Status guarded(F body)
 {
+    auto status = [](StatusCode code, const BaseError & e) {
+        return Status(code, e.message(), errorToJson(e).dump());
+    };
     try {
         body();
         return Status::OK;
-    } catch (Error & e) {
-        return Status(StatusCode::INTERNAL, e.message());
+    } catch (Interrupted & e) {
+        return status(StatusCode::CANCELLED, e);
+    } catch (InvalidPath & e) {
+        return status(StatusCode::NOT_FOUND, e);
+    } catch (BadStorePath & e) {
+        return status(StatusCode::INVALID_ARGUMENT, e);
+    } catch (UsageError & e) {
+        return status(StatusCode::INVALID_ARGUMENT, e);
+    } catch (BaseError & e) {
+        return status(StatusCode::INTERNAL, e);
     } catch (std::exception & e) {
         return Status(StatusCode::INTERNAL, e.what());
     }
@@ -365,10 +380,18 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                 try {
                     store->buildPaths(paths, fromProto(req->mode()));
                     ev.mutable_result()->set_success(true);
-                } catch (Error & e) {
+                } catch (BuildError & e) {
+                    toProto(e, *ev.mutable_result());
+                } catch (BaseError & e) {
+                    /* Non-build failure (e.g. a missing input): still ship
+                       the traces and exit status. */
                     auto * r = ev.mutable_result();
                     r->set_success(false);
                     r->set_error(e.message());
+                    r->set_failure_status((uint32_t) BuildError::MiscFailure);
+                    r->set_exit_status(e.info().status);
+                    for (auto & t : e.info().traces)
+                        r->add_traces(t.hint.str());
                 }
             }
             writer->Write(ev);
@@ -409,10 +432,8 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                         rm.add_signatures(sig.to_string());
                     (*r->mutable_built_outputs())[outputName] = rm;
                 }
-            } else if (auto * failure = result.tryGetFailure()) {
-                r->set_success(false);
-                r->set_error(failure->message());
-            }
+            } else if (auto * failure = result.tryGetFailure())
+                toProto(*failure, *r);
             writer->Write(ev);
         });
     }

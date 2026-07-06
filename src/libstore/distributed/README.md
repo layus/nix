@@ -316,9 +316,29 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
 - [x] Error-mapping cleanup: remote errors are now sent without the rendered
       `error:` prefix (`Error::message()` instead of `msg()` in the gRPC
       result/status paths), so clients no longer print `error: … error: …`.
-- [ ] gRPC ↔ status error-mapping refinements (fidelity of status codes,
-      structured traces); richer progress forwarding for non-build operations
-      (copy/GC over gRPC still report only coarse client-side activities).
+- [x] **gRPC error fidelity.** Server errors used to collapse into
+      `INTERNAL` + flat text, and the client hardcoded `MiscFailure`, so a
+      failed remote build exited 1 (vs 100 locally) with a
+      `build failed on the remote gRPC store:` wrapper. Now: (1) `guarded()`
+      maps error classes to proper status codes (`Interrupted`→`CANCELLED`,
+      `InvalidPath`→`NOT_FOUND`, `UsageError`/`BadStorePath`→
+      `INVALID_ARGUMENT`, else `INTERNAL`) and ships the structured error
+      (message, traces, CLI exit status) as JSON in the status
+      `error_details`; the client rethrows it verbatim, adding an
+      `on gRPC store node '…'` trace naming the node that answered. (2) The
+      wire `BuildResult` carries the real `BuildResultFailureStatus`,
+      `isNonDeterministic`, traces, and exit status; the client rebuilds the
+      exact `BuildError`, and `buildPathsWithResults` reports it as per-path
+      failure results so `throwBuildErrors` rethrows it verbatim — a failing
+      `nix build --store grpc://…` now renders and **exits (100)** exactly
+      like a local failure. (The wire still reports one flat result per
+      request; true per-path results are future work.) Runtime-validated:
+      remote failing build exits 100 with local-identical rendering, and an
+      invalid-path NAR request surfaces the original message with the node
+      trace.
+- [ ] Richer progress forwarding for non-build operations (copy/GC over gRPC
+      still report only coarse client-side activities); per-path build
+      results over the wire.
 - [ ] **Investigate an intermittent gRPC build-client hang.** During the NFS
       concurrent-build stress test (`stress-test.sh`) the `nix build … ^*` client
       was observed **once** to hang indefinitely *after* the build had already

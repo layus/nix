@@ -238,9 +238,24 @@ struct GrpcStore : virtual Store, virtual GcStore
             ctx.AddMetadata("auth-token", config->authToken.get());
     }
 
-    [[noreturn]] static void fail(const grpc::Status & status)
+    /* Rethrow a genuine (non-node-failure) error status. The server ships
+       the structured error in error_details (see errorToJson), so the client
+       rethrows with the original message, traces, and CLI exit status
+       instead of a flat "gRPC store error" string. */
+    [[noreturn]] static void fail(const grpc::Status & status, const std::string & node)
     {
-        throw Error("gRPC store error: %s", status.error_message());
+        if (!status.error_details().empty()) {
+            try {
+                auto j = nlohmann::json::parse(status.error_details());
+                Error err("%s", j.at("msg").get<std::string>());
+                grpc_transport::errorFromJson(err, j);
+                err.addTrace({}, "on gRPC store node '%s'", node);
+                throw err;
+            } catch (nlohmann::json::exception &) {
+                /* unparseable details: fall through to the flat message */
+            }
+        }
+        throw Error("gRPC store error on node '%s': %s", node, status.error_message());
     }
 
     /* A status that means "this node is unreachable/unhealthy" (worth trying
@@ -274,7 +289,7 @@ struct GrpcStore : virtual Store, virtual GcStore
                 return;
             }
             if (!isNodeFailure(s))
-                fail(s);
+                fail(s, targets[idx]);
             lastError = fmt("node '%s': %s", targets[idx], s.error_message());
             debug("gRPC store: %s; trying next node", lastError);
         }
@@ -500,27 +515,28 @@ struct GrpcStore : virtual Store, virtual GcStore
         req.set_verbosity(verbosity);
         /* A build is re-run from scratch on failover (already-valid outputs
            short-circuit), so the whole stream read is retriable. */
-        bool ok = true;
-        std::string err;
+        std::optional<pb::BuildResult> result;
         withFailover([&](pb::NixStore::Stub & stub) -> grpc::Status {
             grpc::ClientContext ctx;
             auth(ctx);
-            ok = true;
-            err.clear();
+            result.reset();
             auto reader = stub.BuildPaths(&ctx, req);
             pb::BuildEvent ev;
             BuildEventPlayer replay;
             while (reader->Read(&ev)) {
-                if (ev.has_result()) {
-                    ok = ev.result().success();
-                    err = ev.result().error();
-                } else
+                if (ev.has_result())
+                    result = ev.result();
+                else
                     replay(ev);
             }
             return reader->Finish();
         });
-        if (!ok)
-            throw Error("build failed on the remote gRPC store: %s", err);
+        if (!result)
+            throw Error("no build result returned from the remote gRPC store");
+        /* Rethrow the failure as the server saw it: same BuildError, same
+           traces, same CLI exit status as a local build failure. */
+        if (!result->success())
+            throw grpc_transport::fromProtoBuildFailure(*result);
     }
 
     std::vector<KeyedBuildResult>
@@ -531,7 +547,20 @@ struct GrpcStore : virtual Store, virtual GcStore
            the per-path results -- mirroring RemoteStore's pre-1.34 fallback so
            that `nix build --store grpc://...` works (it uses this entry point,
            not buildPaths). */
-        buildPaths(paths, buildMode, evalStore);
+        try {
+            buildPaths(paths, buildMode, evalStore);
+        } catch (BuildError & e) {
+            /* The wire reports one flat result for the whole request, so
+               report every requested path as failed with it; with a single
+               requested path, throwBuildErrors() then rethrows the failure
+               verbatim and `nix build` behaves exactly like a local failure
+               (message, traces, exit status). Per-path results over the wire
+               are future work. */
+            std::vector<KeyedBuildResult> results;
+            for (auto & path : paths)
+                results.push_back(KeyedBuildResult{{.inner = e}, path});
+            return results;
+        }
 
         Store & eval = evalStore ? *evalStore : *this;
         std::vector<KeyedBuildResult> results;
@@ -606,7 +635,7 @@ struct GrpcStore : virtual Store, virtual GcStore
                     }
                     br.inner = std::move(success);
                 } else
-                    br.inner = BuildError(BuildResultFailureStatus::MiscFailure, "%s", pr.error());
+                    br.inner = grpc_transport::fromProtoBuildFailure(pr);
                 result = std::move(br);
             }
             return reader->Finish();

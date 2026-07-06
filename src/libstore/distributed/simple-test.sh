@@ -325,6 +325,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# error fidelity: a failing remote build behaves exactly like a local one
+# ---------------------------------------------------------------------------
+echo
+echo "== error fidelity: failing build over gRPC =="
+FEXPR=$(cat <<'NIXEXPR'
+builtins.unsafeDiscardStringContext (derivation {
+  name = "simple-fail";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "echo doomed; exit 3" ];
+}).drvPath
+NIXEXPR
+)
+FDRV=$("${nix_cmd[@]}" eval --raw --impure --expr "$FEXPR")
+"${nix_cmd[@]}" copy --no-check-sigs --derivation --to "$N1" "$FDRV" >/dev/null
+rc=0
+timeout 60 "${nix_cmd[@]}" build --no-link --store "$N1" "$FDRV^*" \
+  >/tmp/simple-fail.out 2>/tmp/simple-fail.err || rc=$?
+# Local parity: same exit status (100), same BuildError message, no wrapper.
+if [ "$rc" = 100 ]; then
+  echo "   OK: exit status 100 (local-parity build failure)"
+else
+  echo "!!! expected exit status 100, got $rc:"; tail -n 5 /tmp/simple-fail.err; fail=1
+fi
+grep -q 'builder failed with exit code 3' /tmp/simple-fail.err \
+  && echo "   OK: original BuildError message preserved" \
+  || { echo "!!! BuildError message lost:"; tail -n 5 /tmp/simple-fail.err; fail=1; }
+grep -q 'error: error:\|remote gRPC store' /tmp/simple-fail.err \
+  && { echo "!!! error still wrapped/nested:"; tail -n 5 /tmp/simple-fail.err; fail=1; } \
+  || echo "   OK: no wrapper, no nested 'error:' prefix"
+
+# ---------------------------------------------------------------------------
 # physical presence on the NFS export (independent read-only mount)
 # ---------------------------------------------------------------------------
 echo

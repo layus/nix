@@ -22,6 +22,7 @@
 #  include "nix-store.pb.h"
 
 #  include <grpcpp/grpcpp.h>
+#  include <nlohmann/json.hpp>
 
 #  include <chrono>
 #  include <cstring>
@@ -92,6 +93,63 @@ inline ValidPathInfo fromProto(const StoreDirConfig & store, const pb::PathInfo 
     info.ultimate = in.ultimate();
     info.registrationTime = in.registration_time();
     return info;
+}
+
+/**
+ * Structured Nix error → JSON, carried in the gRPC status `error_details`
+ * (and mirrored in the wire `BuildResult` for build failures), so the client
+ * can rethrow with the message, traces, and CLI exit status intact instead
+ * of a flat string.
+ */
+inline nlohmann::json errorToJson(const BaseError & e)
+{
+    auto traces = nlohmann::json::array();
+    for (auto & t : e.info().traces)
+        traces.push_back(t.hint.str());
+    return {{"msg", e.message()}, {"status", e.info().status}, {"traces", std::move(traces)}};
+}
+
+/**
+ * Apply `errorToJson` data onto a freshly built client-side error.
+ */
+inline void errorFromJson(BaseError & e, const nlohmann::json & j)
+{
+    e.withExitStatus(j.value("status", 1u));
+    auto & traces = j.at("traces");
+    /* addTrace prepends, so re-add in reverse to restore the order. */
+    for (auto it = traces.rbegin(); it != traces.rend(); ++it)
+        e.addTrace({}, "%s", it->get<std::string>());
+}
+
+/**
+ * Record a build failure in the wire `BuildResult`, faithfully enough for
+ * `fromProtoBuildFailure` to rethrow it.
+ */
+inline void toProto(const BuildError & e, pb::BuildResult & out)
+{
+    out.set_success(false);
+    out.set_error(e.message());
+    out.set_failure_status((uint32_t) e.status);
+    out.set_is_non_deterministic(e.isNonDeterministic);
+    out.set_exit_status(e.info().status);
+    for (auto & t : e.info().traces)
+        out.add_traces(t.hint.str());
+}
+
+/**
+ * Rebuild the `BuildError` a failed build reported, so a remote failure
+ * throws (and exits) exactly like a local one.
+ */
+inline BuildError fromProtoBuildFailure(const pb::BuildResult & in)
+{
+    BuildError e(BuildError::Status(in.failure_status()), "%s", in.error());
+    e.isNonDeterministic = in.is_non_deterministic();
+    if (in.exit_status())
+        e.withExitStatus(in.exit_status());
+    auto & traces = in.traces();
+    for (auto it = traces.rbegin(); it != traces.rend(); ++it)
+        e.addTrace({}, "%s", *it);
+    return e;
 }
 
 /**

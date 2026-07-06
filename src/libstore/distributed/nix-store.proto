@@ -158,9 +158,14 @@ message BuildEvent {
 }
 message BuildResult {
   bool success = 1;
-  string error = 2;
+  string error = 2; // human message, no "error:" prefix
   // On success: realised output name -> its realisation (out path + signatures).
   map<string, Realisation> built_outputs = 3;
+  // On failure, everything needed to rethrow the BuildError faithfully:
+  uint32 failure_status = 4;       // Nix's BuildResultFailureStatus enum, raw
+  bool is_non_deterministic = 5;
+  repeated string traces = 6;      // error traces, most recently added first
+  uint32 exit_status = 7;          // CLI exit status (e.g. 100 for a permanent failure)
 }
 
 message AddPermRootRequest { string store_path = 1; string gc_root = 2; }
