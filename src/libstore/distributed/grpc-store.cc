@@ -191,18 +191,28 @@ struct GrpcStore : virtual Store, virtual GcStore
             std::set<std::filesystem::path> entries; // sorted -> deterministic node order
             try {
                 for (auto & entry : std::filesystem::directory_iterator(regDir))
-                    if (entry.is_regular_file())
+                    if (entry.is_regular_file() && !entry.path().filename().string().starts_with("."))
                         entries.insert(entry.path());
             } catch (std::filesystem::filesystem_error & e) {
                 throw Error("cannot read the cluster node registry '%s': %s", regDir, e.what());
             }
             for (auto & path : entries) {
-                auto addr = trim(readFile(path.string()));
-                if (!addr.empty())
-                    list.push_back(addr);
+                auto entry = grpc_transport::readReplicaEntry(path);
+                if (entry.addr.empty())
+                    continue;
+                /* An entry older than its TTL belongs to a dead node (its
+                   heartbeat stopped); see readReplicaEntry. */
+                if (entry.stale) {
+                    debug(
+                        "ignoring stale replica registration '%s' (older than its %d s TTL)",
+                        path.string(),
+                        entry.ttl);
+                    continue;
+                }
+                list.push_back(entry.addr);
             }
             if (list.empty())
-                throw Error("the cluster node registry '%s' names no nodes", regDir);
+                throw Error("the cluster node registry '%s' names no live nodes", regDir);
         } else
             list = config->nodes.get().empty()
                        ? std::vector<std::string>{std::string(config->target)}

@@ -15,12 +15,17 @@
 #  include "nix/store/build-result.hh"
 #  include "nix/util/hash.hh"
 #  include "nix/util/logging.hh"
+#  include "nix/util/file-system.hh"
+#  include "nix/util/strings.hh"
+#  include "nix/util/util.hh"
 
 #  include "nix-store.pb.h"
 
 #  include <grpcpp/grpcpp.h>
 
+#  include <chrono>
 #  include <cstring>
+#  include <filesystem>
 #  include <functional>
 #  include <string_view>
 
@@ -87,6 +92,46 @@ inline ValidPathInfo fromProto(const StoreDirConfig & store, const pb::PathInfo 
     info.ultimate = in.ultimate();
     info.registrationTime = in.registration_time();
     return info;
+}
+
+/**
+ * Freshness of `var/replicas` registrations, TempRoots-style: a
+ * registration's optional second line declares the TTL (seconds) within
+ * which its node promises to refresh the file's mtime (heartbeat); an entry
+ * older than its TTL belongs to a dead node — clients skip it and live
+ * nodes' heartbeats sweep it away. Reasonably synchronised clocks (NTP) are
+ * assumed, with the heartbeat running at TTL/3 for slack.
+ */
+constexpr uint64_t defaultReplicaTtl = 60;
+
+struct ReplicaEntry
+{
+    std::string addr;
+    uint64_t ttl = defaultReplicaTtl;
+    bool stale = false;
+};
+
+/**
+ * Parse a `var/replicas` registration: line 1 the advertised address,
+ * optional line 2 the TTL. NB: the file is read BEFORE its mtime is checked
+ * — on NFS the open() forces attribute revalidation (close-to-open
+ * consistency), which keeps the staleness check honest despite attribute
+ * caching.
+ */
+inline ReplicaEntry readReplicaEntry(const std::filesystem::path & path)
+{
+    ReplicaEntry res;
+    auto lines = tokenizeString<std::vector<std::string>>(readFile(path.string()), "\n");
+    if (!lines.empty())
+        res.addr = trim(lines[0]);
+    if (lines.size() > 1)
+        if (auto t = string2Int<uint64_t>(trim(lines[1])))
+            res.ttl = *t;
+    std::error_code ec;
+    auto mtime = std::filesystem::last_write_time(path, ec);
+    if (!ec)
+        res.stale = std::chrono::file_clock::now() - mtime > std::chrono::seconds(res.ttl);
+    return res;
 }
 
 /** Logger fields → proto, for build-event forwarding. */

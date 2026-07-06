@@ -136,12 +136,17 @@ two well-known directories:
 - `/var/replicas` — the node registry. Nodes **discover each other** through
   it: `nix-grpc-store-server`, given an advertise address, registers it in
   `/var/replicas/<hostname>` on startup and unregisters on graceful shutdown
-  (SIGTERM/SIGINT). A client passes `grpc://?registry=<dir>` and its failover
-  node list is read from the registry — no static node list anywhere.
-  Discovery requires seeing the share: a client that cannot read the registry
-  (or finds it empty) reports an error and shuts down — there is deliberately
-  no fallback discovery path. The test asserts both directions: the
-  registry-discovering URI serves paths, and an unreadable registry is fatal.
+  (SIGTERM/SIGINT). Registrations carry a **freshness TTL** (TempRoots-style):
+  each node's heartbeat refreshes its file every TTL/3 and sweeps peers'
+  entries that outlived their declared TTL, so a *crashed* node's entry
+  disappears too. A client passes `grpc://?registry=<dir>` and its failover
+  node list is read from the registry, skipping stale entries — no static
+  node list anywhere. Discovery requires seeing the share: a client that
+  cannot read the registry (or finds no live entry in it) reports an error
+  and shuts down — there is deliberately no fallback discovery path. The test
+  asserts all of it: the registry-discovering URI serves paths, an unreadable
+  registry is fatal, and a planted dead-node entry is both skipped by clients
+  and swept by the live nodes' heartbeats.
 
 Same host prerequisites as `stress-test.sh`; run from the repo root:
 
@@ -290,10 +295,24 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       the registry (sorted, deduplicated, authority first if given) — no
       static node list; mutually exclusive with `nodes=`. A client that
       cannot read the registry, or finds it empty, errors out: there is
-      deliberately no fallback discovery path. A crashed node's stale entry
-      is harmless (failover skips it); TTL/heartbeat-based expiry (as for
-      `TempRoots`) is possible later work. Runtime-validated by
+      deliberately no fallback discovery path. Runtime-validated by
       `simple-test.sh`.
+- [x] **Stale-registration TTL** (crashed nodes leave no trace). Modelled on
+      `TempRoots`, but on the share: a registration's second line declares a
+      freshness TTL (default 60 s, `NIX_REPLICA_TTL` to override) within
+      which its node promises to refresh the file's mtime; a heartbeat
+      thread refreshes it every TTL/3 (atomically, write + rename, so
+      readers never see a half-written entry) and sweeps peers' entries
+      that outlived their own TTL. Clients skip stale entries when reading
+      the registry ("names no live nodes" if none survive). Sweeping is
+      safe against races (ENOENT ignored) and against false positives (a
+      live node's next beat rewrites its file whole). NFS attribute caching
+      is defused by reading each entry *before* checking its mtime — over
+      NFS the open() forces attribute revalidation (close-to-open
+      consistency); reasonably synchronised clocks (NTP) are assumed.
+      Runtime-validated: heartbeat refreshes observed, a planted dead entry
+      (TTL 1 s) skipped by a `--debug` client and swept by a live node, live
+      registrations untouched, graceful unregistration still clean.
 - [x] Error-mapping cleanup: remote errors are now sent without the rendered
       `error:` prefix (`Error::message()` instead of `msg()` in the gRPC
       result/status paths), so clients no longer print `error: … error: …`.

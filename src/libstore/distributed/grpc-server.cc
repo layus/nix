@@ -14,11 +14,13 @@
 #  include "nix/store/content-address.hh"
 #  include "nix/util/file-content-address.hh"
 #  include "nix/util/file-system.hh"
+#  include "nix/util/environment-variables.hh"
 
 #  include "nix-store.grpc.pb.h"
 
 #  include <nlohmann/json.hpp>
 
+#  include <condition_variable>
 #  include <csignal>
 #  include <filesystem>
 #  include <mutex>
@@ -464,32 +466,119 @@ struct NixStoreServiceImpl : pb::NixStore::Service
 
 } // namespace
 
-/* Register this node in the share's well-known registry directory
+/* This node's registration in the share's well-known registry directory
    (`<share>/var/replicas/<hostname>`, alongside `<share>/store`), advertising
    `advertise` as this node's address, so that clients can discover the whole
    cluster from the share alone (see the `registry` parameter of `grpc://`).
    Requires the backing store to expose its real filesystem (a
    `distributed://` store): a node asked to register but unable to is
    mis-configured or mis-mounted and must not serve, so failures are fatal.
-   Returns the registration file, to be removed on shutdown. */
-static std::filesystem::path registerReplica(Store & store, const std::string & advertise)
+
+   The registration is kept fresh TempRoots-style (see readReplicaEntry): a
+   heartbeat thread refreshes the file every TTL/3 and sweeps other entries
+   that outlived their own TTL, so a crashed node's registration disappears
+   without any coordinator. The refresh rewrites the whole file, so an entry
+   wrongly swept by a peer (e.g. a clock hiccup) heals within one beat.
+   Destruction stops the heartbeat and unregisters. */
+struct ReplicaRegistration
 {
-    auto * fsStore = dynamic_cast<LocalFSStore *>(&store);
-    if (!fsStore)
-        throw Error("cannot register replica '%s': the backing store exposes no local filesystem", advertise);
+    std::filesystem::path regDir, regFile;
+    std::string content;
+    uint64_t ttl;
 
-    char host[256];
-    if (gethostname(host, sizeof(host)) != 0)
-        throw SysError("getting the hostname for replica registration");
-    host[sizeof(host) - 1] = 0;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stopping = false;
+    std::thread beat;
 
-    auto regDir = fsStore->getRealStoreDir().parent_path() / "var" / "replicas";
-    std::filesystem::create_directories(regDir);
-    auto regFile = regDir / host;
-    writeFile(regFile.string(), advertise + "\n");
-    printInfo("registered replica '%s' at %s", advertise, regFile.string());
-    return regFile;
-}
+    ReplicaRegistration(Store & store, const std::string & advertise)
+        : ttl(replicaTtl())
+    {
+        auto * fsStore = dynamic_cast<LocalFSStore *>(&store);
+        if (!fsStore)
+            throw Error("cannot register replica '%s': the backing store exposes no local filesystem", advertise);
+
+        char host[256];
+        if (gethostname(host, sizeof(host)) != 0)
+            throw SysError("getting the hostname for replica registration");
+        host[sizeof(host) - 1] = 0;
+
+        regDir = fsStore->getRealStoreDir().parent_path() / "var" / "replicas";
+        std::filesystem::create_directories(regDir);
+        regFile = regDir / host;
+        content = fmt("%s\n%d\n", advertise, ttl);
+        touch();
+        printInfo("registered replica '%s' at %s (TTL %ds)", advertise, regFile.string(), ttl);
+        beat = std::thread([this]() { run(); });
+    }
+
+    /* The TTL is overridable for tests (and unusual deployments). */
+    static uint64_t replicaTtl()
+    {
+        if (auto t = getEnv("NIX_REPLICA_TTL"))
+            if (auto n = string2Int<uint64_t>(*t))
+                return std::max<uint64_t>(*n, 3);
+        return defaultReplicaTtl;
+    }
+
+    /* Atomic write + rename, so a reader never sees a half-written entry.
+       Dot-prefixed temp names are skipped by readers and the sweep. */
+    void touch()
+    {
+        auto tmp = regDir / ("." + regFile.filename().string() + ".tmp");
+        writeFile(tmp.string(), content);
+        std::filesystem::rename(tmp, regFile);
+    }
+
+    /* Remove peers' registrations that outlived their declared TTL. Racing
+       sweeps are harmless (ENOENT ignored), and a live node wrongly swept
+       re-registers on its next beat. */
+    void sweep()
+    {
+        for (auto & entry : std::filesystem::directory_iterator(regDir)) {
+            if (!entry.is_regular_file())
+                continue;
+            auto & path = entry.path();
+            if (path == regFile || path.filename().string().starts_with("."))
+                continue;
+            if (readReplicaEntry(path).stale) {
+                std::error_code ec;
+                if (std::filesystem::remove(path, ec); !ec)
+                    printInfo("swept stale replica registration '%s'", path.string());
+            }
+        }
+    }
+
+    void run()
+    {
+        std::unique_lock lock(mutex);
+        while (!stopping) {
+            if (cv.wait_for(lock, std::chrono::seconds(std::max<uint64_t>(ttl / 3, 1)), [this]() { return stopping; }))
+                break;
+            lock.unlock();
+            try {
+                touch();
+                sweep();
+            } catch (std::exception & e) {
+                warn("replica registration heartbeat failed: %s", e.what());
+            }
+            lock.lock();
+        }
+    }
+
+    ~ReplicaRegistration()
+    {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        cv.notify_all();
+        if (beat.joinable())
+            beat.join();
+        std::error_code ec;
+        std::filesystem::remove(regFile, ec);
+    }
+};
 
 /* Written by the signal handler, drained by the shutdown thread: the gRPC
    Shutdown() call is not async-signal-safe, so the handler only pokes a
@@ -508,16 +597,11 @@ void runServer(ref<Store> store, const std::string & listenAddr, const std::stri
 
     /* Registration is an explicit opt-in (an advertise address is given):
        daemon-backed stores can also be served, and those must not scribble a
-       registry next to the host's real /nix/store. */
-    std::optional<std::filesystem::path> regFile;
+       registry next to the host's real /nix/store. Destruction (any exit
+       from this function) stops the heartbeat and unregisters. */
+    std::optional<ReplicaRegistration> registration;
     if (!advertise.empty())
-        regFile = registerReplica(*store, advertise);
-    Finally unregister([&]() {
-        if (regFile) {
-            std::error_code ec;
-            std::filesystem::remove(*regFile, ec);
-        }
-    });
+        registration.emplace(*store, advertise);
 
     /* Graceful shutdown on SIGTERM/SIGINT, so the registration is removed. */
     if (pipe(shutdownPipe) != 0)

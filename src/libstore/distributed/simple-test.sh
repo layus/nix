@@ -67,6 +67,9 @@ REGISTRY=${REGISTRY:-/mnt/nix-store/var/replicas}
 
 BUILD_TIMEOUT=${BUILD_TIMEOUT:-120}
 NIXBLD_N=${NIXBLD_N:-4}
+# Registration freshness TTL for the nodes (heartbeat = TTL/3). Short, so the
+# stale-registration sweep is observable within the test.
+REPLICA_TTL=${REPLICA_TTL:-6}
 
 nix_cmd=("$NIX" --extra-experimental-features 'nix-command flakes')
 
@@ -169,6 +172,7 @@ launch_server() {
   # share's /var/replicas registry for clients to discover.
   docker exec -d "$name" sh -c \
     "umask 022; export PATH=/build/src/nix:\$PATH; export NIX_CONFIG=\"\$(cat /tmp/nix.conf)\"; \
+     export NIX_REPLICA_TTL=$REPLICA_TTL; \
      $SERVER_IN_CONTAINER 0.0.0.0:$PORT '$BACKING' '$TOKEN' '$(node_ip "$name"):$PORT' >/tmp/server.log 2>&1"
   for _ in $(seq 1 30); do
     if docker exec "$name" grep -qi 'listening' /tmp/server.log 2>/dev/null; then return 0; fi
@@ -192,8 +196,9 @@ bring_up_node() {
   # First node up wipes registrations left over from a previous run.
   [ "$first" = first ] && docker exec "$name" sh -c 'rm -f /cluster/var/replicas/*'
   launch_server "$name"
-  # The server registers ITSELF; check the registration landed on the share.
-  reg=$(docker exec "$name" cat "/cluster/var/replicas/$name" 2>/dev/null) \
+  # The server registers ITSELF; check the registration landed on the share
+  # (line 1 = advertised address; line 2 = its freshness TTL).
+  reg=$(docker exec "$name" head -1 "/cluster/var/replicas/$name" 2>/dev/null) \
     || { echo "!!! $name did not register itself in /var/replicas"; docker exec "$name" cat /tmp/server.log; exit 1; }
   echo "   $name up, self-registered in /var/replicas/$name as $reg"
 }
@@ -212,7 +217,7 @@ echo
 echo "== discovery: client-side registry=$REGISTRY =="
 [ "$(ls "$REGISTRY" 2>/dev/null | wc -l)" = 2 ] \
   || { echo "!!! expected two registrations in $REGISTRY:"; ls -la "$REGISTRY" 2>/dev/null; exit 1; }
-echo "   registry entries: $(ls "$REGISTRY" | paste -sd' ' -): $(cat "$REGISTRY"/* | paste -sd' ' -)"
+echo "   registry entries: $(ls "$REGISTRY" | paste -sd' ' -): $(head -qn1 "$REGISTRY"/* | paste -sd' ' -)"
 # No static node list: the client discovers the whole cluster from the share.
 CLUSTER="grpc://?registry=$REGISTRY&auth-token=$TOKEN"
 
@@ -225,6 +230,34 @@ if "${nix_cmd[@]}" store info --store "grpc://?registry=/nonexistent/replicas&au
 else
   echo "   OK: unreadable registry rejected"
 fi
+
+# ---------------------------------------------------------------------------
+# stale-registration TTL: a dead node's entry is skipped and swept
+# ---------------------------------------------------------------------------
+echo
+echo "== stale-registration TTL (nodes heartbeat every $((REPLICA_TTL / 3))s) =="
+# Plant a dead node's registration (declared TTL 1s) via node1's rw mount.
+docker exec node1 sh -c 'printf "10.255.255.1:5570\n1\n" > /cluster/var/replicas/deadnode'
+sleep 2 # let its 1s TTL expire
+# A client reading the registry now must skip it (unless a node's heartbeat
+# already swept it, which is equally correct).
+if "${nix_cmd[@]}" store info --store "$CLUSTER" --debug 2>&1 | grep -q 'ignoring stale replica registration'; then
+  echo "   OK: client skipped the stale registration"
+elif [ -e "$REGISTRY/deadnode" ]; then
+  echo "!!! stale entry present but the client did not skip it"; fail=1
+else
+  echo "   (swept before the client looked -- equally fine)"
+fi
+# A live node's heartbeat must sweep it off the share.
+for _ in $(seq 1 15); do [ -e "$REGISTRY/deadnode" ] || break; sleep 1; done
+if [ -e "$REGISTRY/deadnode" ]; then
+  echo "!!! stale registration never swept by the nodes"; fail=1
+else
+  echo "   OK: stale registration swept by a live node's heartbeat"
+fi
+# The live nodes' own registrations must have survived the sweeping.
+[ "$(ls "$REGISTRY" | wc -l)" = 2 ] \
+  || { echo "!!! live registrations went missing:"; ls -la "$REGISTRY"; fail=1; }
 
 # ---------------------------------------------------------------------------
 # build via node1 ONLY
