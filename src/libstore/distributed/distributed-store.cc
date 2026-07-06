@@ -8,6 +8,7 @@
 #  include "nix/store/derivations.hh"
 #  include "nix/store/pathlocks.hh"
 #  include "nix/store/posix-fs-canonicalise.hh"
+#  include "nix/store/local-settings.hh"
 #  include "nix/util/callback.hh"
 #  include "nix/util/error.hh"
 #  include "nix/util/archive.hh"
@@ -301,8 +302,11 @@ void DistributedStore::addToStore(
     /* TODO: for content-addressed paths (info.ca), re-verify the content
        address against the restored content, as LocalStore does. */
 
-    static const StringSet emptyAcls;
-    canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(emptyAcls)});
+    /* Honour `ignored-acls` (as LocalStore does): some ACLs such as
+       `system.nfs4_acl` cannot be removed even by root, and on shared NFS
+       storage every file carries one, so passing an empty set here made every
+       add fail with EINVAL. */
+    canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
 
     /* Route through our override so a copied-in .drv also gets its output map
        registered (the build needs it). */
@@ -372,8 +376,8 @@ StorePath DistributedStore::addToStoreFromDump(
         narHash = narSink.finish();
     }
 
-    static const StringSet emptyAcls;
-    canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(emptyAcls)});
+    /* Honour `ignored-acls`; see the note in addToStore above. */
+    canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
 
     auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), narHash.hash);
     info.narSize = narHash.numBytesDigested;
