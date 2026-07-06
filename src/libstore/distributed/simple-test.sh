@@ -61,7 +61,7 @@ PORT=5570
 
 HOST_IP=${HOST_IP:-}          # auto-discovered from the docker network gateway
 EXPORT=${EXPORT:-/}           # NFSv4 root (fsid=0 -> /mnt/nix-store)
-NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=50}
+NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=600}
 # The registry as seen from THIS host (which serves the export itself).
 REGISTRY=${REGISTRY:-/mnt/nix-store/var/replicas}
 
@@ -157,7 +157,7 @@ setup_build_users() {
 mount_share() {
   local name=$1 target=$2 mode=$3
   local opts="$NFS_OPTS"
-  [ "$mode" = ro ] && opts="vers=4,ro,noatime,hard,timeo=50"
+  [ "$mode" = ro ] && opts="vers=4,ro,noatime,hard,timeo=600"
   docker exec "$name" sh -c "
     set -e
     mkdir -p '$target'
@@ -365,6 +365,10 @@ if "${nix_cmd[@]}" path-info --store "$N2" "$SOUT" >/dev/null 2>&1; then
 else
   echo "!!! steal-top output not valid:"; tail -n 10 /tmp/simple-steal.err; fail=1
 fi
+# Keep full node logs and the export's scratch state for postmortem.
+docker exec node1 cat /tmp/server.log > /tmp/simple-node1.log 2>/dev/null || true
+docker exec node2 cat /tmp/server.log > /tmp/simple-node2.log 2>/dev/null || true
+ls -la /mnt/nix-store/store/ 2>/dev/null | grep -i chroot > /tmp/simple-chroots.txt || true
 stolen=$(docker exec node2 grep -c 'work stealing: built' /tmp/server.log 2>/dev/null || true)
 if [ "${stolen:-0}" -ge 1 ] 2>/dev/null; then
   echo "   OK: node2 stole and built $stolen derivation(s):"

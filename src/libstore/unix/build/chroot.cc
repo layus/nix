@@ -23,7 +23,20 @@ std::pair<std::filesystem::path, AutoDelete> setupBuildChroot(const BuildChrootP
 
     printMsg(lvlChatty, "setting up chroot environment in %1%", PathFmt(chrootParentDir));
 
-    createDir(chrootParentDir, 0700);
+    try {
+        createDir(chrootParentDir, 0700);
+    } catch (SysError & e) {
+        /* On a shared (NFS) store a retransmitted MKDIR can surface as a
+           spurious EEXIST even right after the deletePath above, and a
+           crashed peer node may also leave a stale directory behind. The
+           caller holds the build lock(s) for this derivation, so no other
+           builder can legitimately own this directory: delete it and retry
+           once. */
+        if (e.errNo != EEXIST)
+            throw;
+        deletePath(chrootParentDir);
+        createDir(chrootParentDir, 0700);
+    }
 
     std::filesystem::path chrootRootDir = chrootParentDir / "root";
 

@@ -85,7 +85,7 @@ PORT=5570
 # with fsid=0 on the server the export root is "/".
 HOST_IP=${HOST_IP:-}          # auto-discovered from the docker network gateway
 EXPORT=${EXPORT:-/}           # NFSv4 root (fsid=0 -> /mnt/nix-store)
-NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=50}
+NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=600}
 
 # Per-build wall-clock cap. The gRPC build client has been observed (once, non-
 # deterministically) to hang after a successful server-side build -- a cold-cache
@@ -195,7 +195,7 @@ setup_build_users() {
 mount_share() {
   local name=$1 target=$2 mode=$3
   local opts="$NFS_OPTS"
-  [ "$mode" = ro ] && opts="vers=4,ro,noatime,hard,timeo=50"
+  [ "$mode" = ro ] && opts="vers=4,ro,noatime,hard,timeo=600"
   docker exec "$name" sh -c "
     set -e
     mkdir -p '$target'

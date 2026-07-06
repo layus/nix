@@ -46,7 +46,7 @@ CACHE_PORT=8666
 
 HOST_IP=${HOST_IP:-}
 EXPORT=${EXPORT:-/}
-NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=50}
+NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=600}
 NIXBLD_N=${NIXBLD_N:-4}
 
 N_ITERS=${N_ITERS:-100}
