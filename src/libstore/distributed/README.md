@@ -351,6 +351,20 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       deadline-less client `Read` stalling while a slow substitution holds the
       backend's single libpq mutex) rather than a structural deadlock. The stress
       test wraps every build in `timeout` so it cannot wedge the harness.
+      **Hunted, not reproduced (100/100 clean):** `hang-hunt.sh` recreates the
+      suspected scenario deliberately — two NFS nodes whose *only* substituter
+      is a rate-limited local binary cache (150 kB/s), a fresh top-level
+      derivation per iteration whose two unique ~256 KiB deps are substituted
+      cold while the same drv races the build lock at both nodes, with a
+      cycling client-launch offset to scan timing windows. Every client runs
+      under `gdb --batch --return-child-result`, so a wedged client would have
+      its thread stacks dumped automatically (SIGINT to gdb) and the
+      environment kept for postmortem. 100 iterations: 0 hangs, 0 failures,
+      client wall-clock 7–19 s against a 90 s cap. So either the window is
+      rarer than 1/100 under these conditions, or an ingredient of the
+      original occurrence (e.g. real cache.nixos.org latency profiles, larger
+      closures, TLS) is still missing. Rerun with `N_ITERS=1000`, a different
+      `RATE`, or bigger deps to keep digging.
 - [ ] `SQLiteMetadataBackend` — optionally relocate `LocalStore`'s SQL behind
       the seam for code sharing (not required for the distributed store).
 - [ ] DB-coordinated GC (roots table + GC lease) replacing the gc-socket
