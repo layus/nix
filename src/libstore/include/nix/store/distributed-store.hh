@@ -287,7 +287,7 @@ private:
 
     /** Background work stealer (only started with `work-stealing`). */
     std::thread stealerThread;
-    void stealOne();
+    void stealSome();
 };
 
 } // namespace nix

@@ -145,7 +145,8 @@ docker exec cockroach cockroach sql --insecure -e "CREATE DATABASE IF NOT EXISTS
 echo "   CockroachDB ready, database '$DB' created"
 
 DBURL="postgresql://root@cockroach:26257/$DB"
-BACKING="distributed://?metadata-db-url=$DBURL&real=/cluster/store"
+# Work stealing on: idle nodes pick up builds the other node has queued.
+BACKING="distributed://?metadata-db-url=$DBURL&real=/cluster/store&work-stealing=true&work-stealing-interval=2"
 
 # ---------------------------------------------------------------------------
 # node / container helpers
@@ -330,6 +331,11 @@ for i in $(seq 1 "$N_SLOW"); do
     fail=1
   fi
   [ "$i" = 1 ] && FIRST_OUT="$out1"
+done
+
+echo "== work stealing observed in node logs (informational) =="
+for n in node1 node2; do
+  echo "--- $n: $(docker exec "$n" grep -c 'work stealing: built' /tmp/server.log 2>/dev/null || true) stolen build(s)"
 done
 
 echo "== build-lock behaviour observed in node logs (informational) =="

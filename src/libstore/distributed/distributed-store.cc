@@ -9,6 +9,7 @@
 #  include "nix/store/pathlocks.hh"
 #  include "nix/store/posix-fs-canonicalise.hh"
 #  include "nix/store/local-settings.hh"
+#  include "nix/store/globals.hh"
 #  include "nix/util/callback.hh"
 #  include "nix/util/error.hh"
 #  include "nix/util/archive.hh"
@@ -189,7 +190,7 @@ DistributedStore::DistributedStore(ref<const Config> config)
                     break;
                 lk.unlock();
                 try {
-                    stealOne();
+                    stealSome();
                 } catch (std::exception & e) {
                     /* The advertiser still owns the goal and will build (or
                        properly fail) it itself; just report. */
@@ -731,25 +732,35 @@ std::unique_ptr<BuildAdvertisement> DistributedStore::advertiseBuild(const Store
     return std::make_unique<BuildAd>(*this, drvPath);
 }
 
-void DistributedStore::stealOne()
+void DistributedStore::stealSome()
 {
-    /* Only steal when this node is otherwise idle. */
-    if (activeLocalBuilds.load() > 0)
+    /* Steal only spare capacity: local builds — our own and RPC-initiated
+       alike, both counted via their live build-lock handles — come first. */
+    uint64_t maxJobs = settings.getWorkerSettings().maxBuildJobs.get();
+    uint64_t active = activeLocalBuilds.load();
+    if (active >= maxJobs)
         return;
-    auto candidates = backend->queryStealableBuilds(nodeId, 1);
-    if (candidates.empty())
+
+    std::vector<DerivedPath> targets;
+    for (auto & drvPath : backend->queryStealableBuilds(nodeId, maxJobs - active)) {
+        /* The .drv must have reached the shared store (the advertiser built
+           or imported it there); otherwise leave it to its advertiser. */
+        if (!isValidPath(drvPath))
+            continue;
+        printInfo("work stealing: building '%s'", printStorePath(drvPath));
+        targets.push_back(DerivedPath::Built{
+            .drvPath = makeConstantStorePathRef(drvPath),
+            .outputs = OutputsSpec::All{},
+        });
+    }
+    if (targets.empty())
         return;
-    auto & drvPath = candidates.front();
-    /* The .drv must have reached the shared store (the advertiser built or
-       imported it there); otherwise leave it to its advertiser. */
-    if (!isValidPath(drvPath))
-        return;
-    printInfo("work stealing: building '%s'", printStorePath(drvPath));
-    buildPaths({DerivedPath::Built{
-        .drvPath = makeConstantStorePathRef(drvPath),
-        .outputs = OutputsSpec::All{},
-    }});
-    printInfo("work stealing: built '%s'", printStorePath(drvPath));
+
+    /* One buildPaths call for the whole batch: the Worker parallelises the
+       stolen builds up to max-jobs. */
+    buildPaths(targets);
+    for (auto & t : targets)
+        printInfo("work stealing: built '%s'", t.to_string(*this));
 }
 
 static RegisterStoreImplementation<DistributedStore::Config> regDistributedStore;

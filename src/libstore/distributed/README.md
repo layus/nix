@@ -302,11 +302,15 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       machinery (`buildPaths`), so substitution, sandboxing, and registration
       all behave as usual. Validated by `simple-test.sh`: with `max-jobs = 1`
       and two slow deps fired at node1 only, node2 steals and builds one.
-- [ ] Work-stealing refinements: steal more than one derivation at a time on
-      multi-slot nodes; count remote (RPC-initiated) builds toward idleness;
-      stolen-build log lines currently go to the stealer's server log (and
-      can interleave into a concurrent RPC build's stream, since the logger
-      is process-global).
+- [x] Work-stealing refinements: nodes steal in batches up to their spare
+      `max-jobs` capacity (one `buildPaths` call; the Worker parallelises),
+      and idleness accounts for *all* local builds — RPC-initiated and stolen
+      alike — because the build-lock handles that drive the counter are taken
+      by every local build. The stress test now runs with work stealing
+      enabled and reports per-node steal counts.
+- [ ] Stolen-build log lines go to the stealer's server log and can
+      interleave into a concurrent RPC build's stream (the logger is
+      process-global).
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).
