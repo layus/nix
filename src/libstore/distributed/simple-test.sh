@@ -19,16 +19,16 @@
 #
 #   /store         -- the shared store contents (`real=/cluster/store`);
 #   /var/replicas  -- the node registry. Nodes DISCOVER EACH OTHER through it:
-#                     each node, once its server is ready, registers its gRPC
-#                     address in /var/replicas/<name>. The client then needs no
-#                     static node list: this test assembles its failover URI
-#                     (grpc://first?nodes=...) purely from that registry.
-#                     Discovery REQUIRES seeing the share: a client that cannot
-#                     read the registry must report an error and shut down (no
-#                     fallback); this test does exactly that if the registry is
-#                     unreadable or incomplete. (Registration is done by the
-#                     test harness on the node's behalf; folding it into
-#                     nix-grpc-store-server is the natural next step.)
+#                     nix-grpc-store-server ITSELF registers its advertised
+#                     gRPC address in /var/replicas/<hostname> on startup
+#                     (and unregisters on graceful shutdown). The client then
+#                     needs no static node list: this test uses
+#                     `grpc://?registry=<dir>` so the failover list is read
+#                     from the registry (the host reads it straight from the
+#                     export it serves, /mnt/nix-store/var/replicas).
+#                     Discovery REQUIRES seeing the share: a client that
+#                     cannot read the registry reports an error and shuts
+#                     down (no fallback) -- this test checks that too.
 #
 # KNOWN ISSUE this test guards against: an intermittent gRPC build-client hang
 # after a successful server-side build (see README.md roadmap). The build is
@@ -62,6 +62,8 @@ PORT=5570
 HOST_IP=${HOST_IP:-}          # auto-discovered from the docker network gateway
 EXPORT=${EXPORT:-/}           # NFSv4 root (fsid=0 -> /mnt/nix-store)
 NFS_OPTS=${NFS_OPTS:-vers=4,rw,noatime,hard,timeo=50}
+# The registry as seen from THIS host (which serves the export itself).
+REGISTRY=${REGISTRY:-/mnt/nix-store/var/replicas}
 
 BUILD_TIMEOUT=${BUILD_TIMEOUT:-120}
 NIXBLD_N=${NIXBLD_N:-4}
@@ -116,7 +118,8 @@ node_ip() { docker inspect -f "{{.NetworkSettings.Networks.$NET.IPAddress}}" "$1
 
 start_container() {
   local name=$1
-  docker run -d --name "$name" --network "$NET" --privileged --user 0 \
+  # --hostname: the server registers itself as /var/replicas/<hostname>.
+  docker run -d --name "$name" --hostname "$name" --network "$NET" --privileged --user 0 \
     -v /nix/store:/nix/store:ro \
     -v "$BUILD_DIR:/build:ro" \
     -e HOME=/root -e NIX_STATE_DIR=/var/nix-state -e NIX_CONF_DIR=/etc/nix \
@@ -162,9 +165,11 @@ launch_server() {
     'builders =' \
     'max-jobs = $NIXBLD_N' \
     'experimental-features = nix-command flakes' > /tmp/nix.conf"
+  # The advertised address (4th arg) is what the server registers in the
+  # share's /var/replicas registry for clients to discover.
   docker exec -d "$name" sh -c \
     "umask 022; export PATH=/build/src/nix:\$PATH; export NIX_CONFIG=\"\$(cat /tmp/nix.conf)\"; \
-     $SERVER_IN_CONTAINER 0.0.0.0:$PORT '$BACKING' '$TOKEN' >/tmp/server.log 2>&1"
+     $SERVER_IN_CONTAINER 0.0.0.0:$PORT '$BACKING' '$TOKEN' '$(node_ip "$name"):$PORT' >/tmp/server.log 2>&1"
   for _ in $(seq 1 30); do
     if docker exec "$name" grep -qi 'listening' /tmp/server.log 2>/dev/null; then return 0; fi
     if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]; then
@@ -187,9 +192,10 @@ bring_up_node() {
   # First node up wipes registrations left over from a previous run.
   [ "$first" = first ] && docker exec "$name" sh -c 'rm -f /cluster/var/replicas/*'
   launch_server "$name"
-  # Discovery: the node registers its gRPC address at the well-known location.
-  docker exec "$name" sh -c "echo '$(node_ip "$name"):$PORT' > /cluster/var/replicas/$name"
-  echo "   $name up at $(node_ip "$name"), registered in /var/replicas/"
+  # The server registers ITSELF; check the registration landed on the share.
+  reg=$(docker exec "$name" cat "/cluster/var/replicas/$name" 2>/dev/null) \
+    || { echo "!!! $name did not register itself in /var/replicas"; docker exec "$name" cat /tmp/server.log; exit 1; }
+  echo "   $name up, self-registered in /var/replicas/$name as $reg"
 }
 
 # node1 first, so it creates the DB schema and cleans the registry.
@@ -200,19 +206,25 @@ N1="grpc://$(node_ip node1):$PORT?auth-token=$TOKEN"
 N2="grpc://$(node_ip node2):$PORT?auth-token=$TOKEN"
 
 # ---------------------------------------------------------------------------
-# discovery: assemble the client's cluster URI purely from the NFS registry
+# discovery: the client reads the node registry itself (registry= parameter)
 # ---------------------------------------------------------------------------
 echo
-echo "== discovery: read the node registry from the share =="
-NODES=$(docker exec node2 sh -c 'cat /cluster/var/replicas/* 2>/dev/null | paste -sd, -')
-FIRST_NODE=${NODES%%,*}
-[ -n "$NODES" ] && [ "$NODES" != "$FIRST_NODE" ] \
-  || { echo "!!! expected two registered nodes, got: '$NODES'"; exit 1; }
-CLUSTER="grpc://$FIRST_NODE?nodes=$NODES&auth-token=$TOKEN"
-echo "   registry: $NODES"
-echo "   cluster URI (from registry alone): grpc://$FIRST_NODE?nodes=$NODES"
+echo "== discovery: client-side registry=$REGISTRY =="
+[ "$(ls "$REGISTRY" 2>/dev/null | wc -l)" = 2 ] \
+  || { echo "!!! expected two registrations in $REGISTRY:"; ls -la "$REGISTRY" 2>/dev/null; exit 1; }
+echo "   registry entries: $(ls "$REGISTRY" | paste -sd' ' -): $(cat "$REGISTRY"/* | paste -sd' ' -)"
+# No static node list: the client discovers the whole cluster from the share.
+CLUSTER="grpc://?registry=$REGISTRY&auth-token=$TOKEN"
 
 fail=0
+
+echo "== discovery failure: unreadable registry must be a fatal error =="
+if "${nix_cmd[@]}" store info --store "grpc://?registry=/nonexistent/replicas&auth-token=$TOKEN" >/dev/null 2>&1; then
+  echo "!!! a client with an unreadable registry should error out, but succeeded"
+  fail=1
+else
+  echo "   OK: unreadable registry rejected"
+fi
 
 # ---------------------------------------------------------------------------
 # build via node1 ONLY
@@ -272,11 +284,11 @@ else
   echo "!!! nix store verify via node2 failed"; fail=1
 fi
 
-echo "== discovered cluster URI serves the path too =="
+echo "== discovery-based cluster URI serves the path too =="
 if "${nix_cmd[@]}" path-info --store "$CLUSTER" "$OUT" >/dev/null 2>&1; then
-  echo "   OK: path valid via registry-derived grpc://...?nodes=... URI"
+  echo "   OK: path valid via grpc://?registry=... (no static node list)"
 else
-  echo "!!! path-info via the discovered cluster URI failed"; fail=1
+  echo "!!! path-info via the registry-discovering cluster URI failed"; fail=1
 fi
 
 # ---------------------------------------------------------------------------

@@ -36,9 +36,19 @@ grpc::Status checkAuth(grpc::ServerContext & ctx, const std::string & token);
 
 /**
  * Serve `store` over gRPC on `listenAddr` (e.g. "0.0.0.0:5570"), requiring the
- * preshared `token` if non-empty. Blocks until the server is shut down.
+ * preshared `token` if non-empty. Blocks until the server is shut down
+ * (gracefully on SIGTERM/SIGINT).
+ *
+ * If `advertise` is non-empty, the node registers that address in the share's
+ * `var/replicas/<hostname>` registry (requires the backing store to expose
+ * its real filesystem, i.e. a `distributed://` store; fatal otherwise) and
+ * unregisters on shutdown.
  */
-void runServer(ref<Store> store, const std::string & listenAddr, const std::string & token);
+void runServer(
+    ref<Store> store,
+    const std::string & listenAddr,
+    const std::string & token,
+    const std::string & advertise = "");
 
 /** Fill a `PathInfo` message from a `ValidPathInfo`. */
 inline void toProto(const StoreDirConfig & store, const ValidPathInfo & info, pb::PathInfo & out)

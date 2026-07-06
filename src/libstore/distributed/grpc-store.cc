@@ -15,6 +15,7 @@
 #  include "nix/util/callback.hh"
 #  include "nix/util/strings.hh"
 #  include "nix/util/logging.hh"
+#  include "nix/util/util.hh"
 
 #  include "nix-store.grpc.pb.h"
 
@@ -23,7 +24,9 @@
 
 #  include <atomic>
 #  include <fcntl.h>
+#  include <filesystem>
 #  include <limits>
+#  include <set>
 #  include <unistd.h>
 #  include <vector>
 
@@ -93,6 +96,18 @@ struct GrpcStoreConfig : std::enable_shared_from_this<GrpcStoreConfig>, virtual 
         "nodes",
         "Comma-separated list of cluster nodes (`host:port`) to fail over across. Defaults to the URI authority."};
 
+    Setting<std::string> registry{
+        this,
+        "",
+        "registry",
+        "Path to the cluster's node registry directory (the shared store's "
+        "`var/replicas`, where every node registers its address). The failover "
+        "node list is read from it, so no static list is needed: "
+        "`grpc://?registry=/cluster/var/replicas`. Requires the share to be "
+        "reachable; an unreadable or empty registry is a fatal error (there is "
+        "deliberately no fallback discovery path). Mutually exclusive with "
+        "`nodes`."};
+
     static const std::string name()
     {
         return "Distributed Store (gRPC client)";
@@ -159,19 +174,49 @@ struct GrpcStore : virtual Store, virtual GcStore
         : Store{*config}
         , config{config}
     {
-        /* The cluster nodes to fail over across: the `nodes` parameter if
-           given, otherwise the single node in the URI authority. */
-        auto list = config->nodes.get().empty()
-                        ? std::vector<std::string>{std::string(config->target)}
-                        : tokenizeString<std::vector<std::string>>(config->nodes.get(), ",");
+        /* The cluster nodes to fail over across: the share's node registry if
+           `registry` is given, else the `nodes` parameter if given, otherwise
+           the single node in the URI authority. */
+        std::vector<std::string> list;
+        if (auto regDir = config->registry.get(); !regDir.empty()) {
+            if (!config->nodes.get().empty())
+                throw UsageError("the 'registry' and 'nodes' parameters of a 'grpc://' store are mutually exclusive");
+            /* Discovery from the registry the nodes maintain on the share
+               (`var/replicas/<node>`, one advertised address per file). A
+               client that cannot read the registry must fail: there is
+               deliberately no fallback discovery path. The URI authority, if
+               any, is tried first. */
+            if (!config->target.empty())
+                list.push_back(config->target);
+            std::set<std::filesystem::path> entries; // sorted -> deterministic node order
+            try {
+                for (auto & entry : std::filesystem::directory_iterator(regDir))
+                    if (entry.is_regular_file())
+                        entries.insert(entry.path());
+            } catch (std::filesystem::filesystem_error & e) {
+                throw Error("cannot read the cluster node registry '%s': %s", regDir, e.what());
+            }
+            for (auto & path : entries) {
+                auto addr = trim(readFile(path.string()));
+                if (!addr.empty())
+                    list.push_back(addr);
+            }
+            if (list.empty())
+                throw Error("the cluster node registry '%s' names no nodes", regDir);
+        } else
+            list = config->nodes.get().empty()
+                       ? std::vector<std::string>{std::string(config->target)}
+                       : tokenizeString<std::vector<std::string>>(config->nodes.get(), ",");
+        StringSet seen;
         for (auto & target : list) {
-            if (target.empty())
+            if (target.empty() || !seen.insert(target).second)
                 continue;
             targets.push_back(target);
             stubs.push_back(pb::NixStore::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials())));
         }
         if (stubs.empty())
-            throw UsageError("a 'grpc://' store must name at least one node (in the authority or the 'nodes' parameter)");
+            throw UsageError(
+                "a 'grpc://' store must name at least one node (in the authority or the 'nodes'/'registry' parameters)");
     }
 
     void anchor() override {}

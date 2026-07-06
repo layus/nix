@@ -134,13 +134,14 @@ two well-known directories:
 
 - `/store` — the store contents (`real=/cluster/store`);
 - `/var/replicas` — the node registry. Nodes **discover each other** through
-  it: each node registers its gRPC address in `/var/replicas/<name>` once its
-  server is ready, and a client can assemble its failover URI
-  (`grpc://first?nodes=…`) from that registry alone, with no static node list.
+  it: `nix-grpc-store-server`, given an advertise address, registers it in
+  `/var/replicas/<hostname>` on startup and unregisters on graceful shutdown
+  (SIGTERM/SIGINT). A client passes `grpc://?registry=<dir>` and its failover
+  node list is read from the registry — no static node list anywhere.
   Discovery requires seeing the share: a client that cannot read the registry
-  must report an error and shut down — there is deliberately no fallback
-  discovery path. (For now the test harness registers on the node's behalf;
-  folding registration into `nix-grpc-store-server` is the natural next step.)
+  (or finds it empty) reports an error and shuts down — there is deliberately
+  no fallback discovery path. The test asserts both directions: the
+  registry-discovering URI serves paths, and an unreadable registry is fatal.
 
 Same host prerequisites as `stress-test.sh`; run from the repo root:
 
@@ -277,11 +278,28 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       `grpc://` renders builder lines with the local `drvname>` prefix exactly
       like a local build, without `-L` they are suppressed, and a failing
       build streams its last lines live before the structured error.
-- [ ] gRPC ↔ status error-mapping refinements (e.g. the redundant nested
-      `error:` prefix on remote build failures); dynamic node discovery: the
-      NFS registry convention (`/var/replicas`, see `simple-test.sh`) folded
-      into `nix-grpc-store-server`; a client that cannot read the registry
-      must report an error and shut down (no fallback discovery path).
+- [x] **Node discovery via the share** (`/var/replicas`). Server side:
+      `nix-grpc-store-server <listen> <store> [token] [advertise-addr]` —
+      given an advertise address, the node registers it in the share's
+      `var/replicas/<hostname>` on startup and unregisters on graceful
+      shutdown (SIGTERM/SIGINT via a signal-safe shutdown pipe). Registration
+      is opt-in precisely because daemon-backed stores can also be served and
+      must not scribble a registry next to the host's real `/nix/store`; a
+      node *asked* to register but unable to is mis-mounted and fails hard.
+      Client side: `grpc://?registry=<dir>` reads the failover node list from
+      the registry (sorted, deduplicated, authority first if given) — no
+      static node list; mutually exclusive with `nodes=`. A client that
+      cannot read the registry, or finds it empty, errors out: there is
+      deliberately no fallback discovery path. A crashed node's stale entry
+      is harmless (failover skips it); TTL/heartbeat-based expiry (as for
+      `TempRoots`) is possible later work. Runtime-validated by
+      `simple-test.sh`.
+- [x] Error-mapping cleanup: remote errors are now sent without the rendered
+      `error:` prefix (`Error::message()` instead of `msg()` in the gRPC
+      result/status paths), so clients no longer print `error: … error: …`.
+- [ ] gRPC ↔ status error-mapping refinements (fidelity of status codes,
+      structured traces); richer progress forwarding for non-build operations
+      (copy/GC over gRPC still report only coarse client-side activities).
 - [ ] **Investigate an intermittent gRPC build-client hang.** During the NFS
       concurrent-build stress test (`stress-test.sh`) the `nix build … ^*` client
       was observed **once** to hang indefinitely *after* the build had already

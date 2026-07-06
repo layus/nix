@@ -13,13 +13,18 @@
 #  include "nix/store/derivations.hh"
 #  include "nix/store/content-address.hh"
 #  include "nix/util/file-content-address.hh"
+#  include "nix/util/file-system.hh"
 
 #  include "nix-store.grpc.pb.h"
 
 #  include <nlohmann/json.hpp>
 
+#  include <csignal>
+#  include <filesystem>
 #  include <mutex>
 #  include <sstream>
+#  include <thread>
+#  include <unistd.h>
 
 #  include <grpcpp/grpcpp.h>
 #  include <grpcpp/server_builder.h>
@@ -123,7 +128,7 @@ Status guarded(F body)
         body();
         return Status::OK;
     } catch (Error & e) {
-        return Status(StatusCode::INTERNAL, e.msg());
+        return Status(StatusCode::INTERNAL, e.message());
     } catch (std::exception & e) {
         return Status(StatusCode::INTERNAL, e.what());
     }
@@ -361,7 +366,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                 } catch (Error & e) {
                     auto * r = ev.mutable_result();
                     r->set_success(false);
-                    r->set_error(e.msg());
+                    r->set_error(e.message());
                 }
             }
             writer->Write(ev);
@@ -404,7 +409,7 @@ struct NixStoreServiceImpl : pb::NixStore::Service
                 }
             } else if (auto * failure = result.tryGetFailure()) {
                 r->set_success(false);
-                r->set_error(failure->msg());
+                r->set_error(failure->message());
             }
             writer->Write(ev);
         });
@@ -459,7 +464,39 @@ struct NixStoreServiceImpl : pb::NixStore::Service
 
 } // namespace
 
-void runServer(ref<Store> store, const std::string & listenAddr, const std::string & token)
+/* Register this node in the share's well-known registry directory
+   (`<share>/var/replicas/<hostname>`, alongside `<share>/store`), advertising
+   `advertise` as this node's address, so that clients can discover the whole
+   cluster from the share alone (see the `registry` parameter of `grpc://`).
+   Requires the backing store to expose its real filesystem (a
+   `distributed://` store): a node asked to register but unable to is
+   mis-configured or mis-mounted and must not serve, so failures are fatal.
+   Returns the registration file, to be removed on shutdown. */
+static std::filesystem::path registerReplica(Store & store, const std::string & advertise)
+{
+    auto * fsStore = dynamic_cast<LocalFSStore *>(&store);
+    if (!fsStore)
+        throw Error("cannot register replica '%s': the backing store exposes no local filesystem", advertise);
+
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0)
+        throw SysError("getting the hostname for replica registration");
+    host[sizeof(host) - 1] = 0;
+
+    auto regDir = fsStore->getRealStoreDir().parent_path() / "var" / "replicas";
+    std::filesystem::create_directories(regDir);
+    auto regFile = regDir / host;
+    writeFile(regFile.string(), advertise + "\n");
+    printInfo("registered replica '%s' at %s", advertise, regFile.string());
+    return regFile;
+}
+
+/* Written by the signal handler, drained by the shutdown thread: the gRPC
+   Shutdown() call is not async-signal-safe, so the handler only pokes a
+   pipe. */
+static int shutdownPipe[2] = {-1, -1};
+
+void runServer(ref<Store> store, const std::string & listenAddr, const std::string & token, const std::string & advertise)
 {
     NixStoreServiceImpl service(store, token);
     grpc::ServerBuilder builder;
@@ -468,8 +505,40 @@ void runServer(ref<Store> store, const std::string & listenAddr, const std::stri
     auto server = builder.BuildAndStart();
     if (!server)
         throw Error("could not start gRPC server on '%s'", listenAddr);
+
+    /* Registration is an explicit opt-in (an advertise address is given):
+       daemon-backed stores can also be served, and those must not scribble a
+       registry next to the host's real /nix/store. */
+    std::optional<std::filesystem::path> regFile;
+    if (!advertise.empty())
+        regFile = registerReplica(*store, advertise);
+    Finally unregister([&]() {
+        if (regFile) {
+            std::error_code ec;
+            std::filesystem::remove(*regFile, ec);
+        }
+    });
+
+    /* Graceful shutdown on SIGTERM/SIGINT, so the registration is removed. */
+    if (pipe(shutdownPipe) != 0)
+        throw SysError("creating the shutdown pipe");
+    struct sigaction sa = {};
+    sa.sa_handler = [](int) { [[maybe_unused]] auto _ = ::write(shutdownPipe[1], "x", 1); };
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+    std::thread shutdownThread([&]() {
+        char c;
+        if (::read(shutdownPipe[0], &c, 1) == 1)
+            server->Shutdown();
+    });
+
     printInfo("nix distributed-store gRPC server listening on %s", listenAddr);
     server->Wait();
+
+    /* Wake the shutdown thread if the server stopped for another reason. */
+    [[maybe_unused]] auto _ = ::write(shutdownPipe[1], "x", 1);
+    shutdownThread.join();
+    printInfo("gRPC server shut down");
 }
 
 } // namespace nix::grpc_transport
