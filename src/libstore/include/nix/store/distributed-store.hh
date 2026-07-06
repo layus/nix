@@ -9,8 +9,10 @@
 #  include "nix/store/metadata-backend.hh"
 
 #  include <condition_variable>
+#  include <map>
 #  include <memory>
 #  include <mutex>
+#  include <optional>
 #  include <thread>
 
 namespace nix {
@@ -162,9 +164,52 @@ struct DistributedStore : virtual LocalStore
     std::optional<TrustedFlag> isTrustedClient() override;
 
     /**
-     * Register `path` as a temporary root in the shared database so that no
-     * node's collector deletes it while it is in use here. Kept alive by the
-     * heartbeat thread until this store is destroyed.
+     * RAII pin keeping `path` protected from every node's collector while an
+     * operation on this node uses it. Pins form a multiset (a map from path
+     * to pin count): the FIRST pin for a path registers its temp root
+     * synchronously — the path is protected cluster-wide by the time
+     * `pinPath` returns — and while any pin for it is alive, the heartbeat
+     * keeps the root renewed. When the last pin dies the path leaves the
+     * set: its database row is no longer renewed and simply lapses after the
+     * temp-root TTL, which therefore bounds both a crashed node's leftovers
+     * and the post-operation reclaim latency (and keeps covering the window
+     * between an operation finishing and the client registering a permanent
+     * root, as LocalStore's connection-lifetime temp roots do).
+     */
+    class [[nodiscard]] TempRootPin
+    {
+        friend struct DistributedStore;
+
+        DistributedStore * store = nullptr;
+        std::optional<StorePath> path;
+
+        TempRootPin(DistributedStore & store, const StorePath & path);
+
+    public:
+        TempRootPin() = default;
+        TempRootPin(const TempRootPin &) = delete;
+        TempRootPin & operator=(const TempRootPin &) = delete;
+
+        TempRootPin(TempRootPin && other) noexcept
+            : store(other.store)
+            , path(std::move(other.path))
+        {
+            other.store = nullptr;
+        }
+
+        ~TempRootPin();
+    };
+
+    /**
+     * Acquire a pin for `path` (see `TempRootPin`).
+     */
+    TempRootPin pinPath(const StorePath & path);
+
+    /**
+     * One-shot cluster-wide protection of `path` for the temp-root TTL, for
+     * callers without an operation scope (the generic `Store` machinery).
+     * The root is NOT renewed by the heartbeat; operations of this store
+     * itself hold `TempRootPin`s instead.
      */
     void addTempRoot(const StorePath & path) override;
 
@@ -184,11 +229,18 @@ private:
     /** Identifies this process/node for the GC lease and temp roots. */
     std::string nodeId;
 
-    /** Background heartbeat that keeps this node's temp roots alive. */
+    /** Background heartbeat that keeps pinned temp roots and held build
+        locks alive. */
     std::thread heartbeatThread;
     std::mutex heartbeatMutex;
     std::condition_variable heartbeatCv;
     bool heartbeatStop = false;
+
+    /** The pin multiset: paths currently in use by operations on this node,
+        with their pin counts (see `TempRootPin`). Guarded by `pinsMutex`;
+        the heartbeat renews exactly these paths' temp roots. */
+    std::mutex pinsMutex;
+    std::map<StorePath, unsigned> pinnedPaths;
 };
 
 } // namespace nix

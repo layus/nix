@@ -263,10 +263,27 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       refreshes `registered`, GC logs `removed 1 expired GC root(s)` after
       the lifetime, and after a graceful node restart the next GC physically
       reclaims the path.
-- [ ] Roots pinned by a *live* node's temp roots are still not collectable
-      until that node restarts (the heartbeat renews all of a node's temp
-      roots indefinitely). Scoping temp-root renewal to in-flight operations
-      only is the remaining GC-precision work.
+- [x] **Temp roots are RAII pins scoped to in-flight operations.** A node
+      used to renew a temp root for every path it had ever touched for as
+      long as it lived, making GC reclaim on a live cluster nearly
+      impossible. Now paths in use are held by `TempRootPin` RAII objects
+      backed by a pin multiset (path → pin count): the first pin registers
+      the temp root synchronously (the path is protected cluster-wide before
+      the operation proceeds), the heartbeat renews exactly the pinned
+      paths, and when the last pin dies the path leaves the set — its
+      database row is deliberately left to lapse via the temp-root TTL
+      (600 s, `NIX_TEMP_ROOT_TTL` to override), which thus bounds both a
+      crashed node's leftovers and the post-operation reclaim latency, and
+      keeps covering the window between an operation finishing and the
+      client registering a permanent root (as LocalStore's
+      connection-lifetime temp roots do). The plain `addTempRoot` virtual
+      remains as one-shot TTL protection for generic `Store` machinery.
+      Found and fixed by the validation: `collectGarbage` never invalidated
+      the in-memory path-info cache, so a long-running node kept answering
+      "valid" for paths it had itself just reclaimed. Runtime-validated
+      against a single live node (TTL 5 s): a just-added path survives an
+      immediate GC, is reclaimed by a GC after the TTL — no node restart —
+      and is reported invalid afterwards.
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).

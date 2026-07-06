@@ -19,16 +19,32 @@
 #  include "nix/util/file-content-address.hh"
 #  include "nix/util/finally.hh"
 #  include "nix/util/signals.hh"
+#  include "nix/util/environment-variables.hh"
+#  include "nix/util/util.hh"
 
 #  include <unistd.h>
 
 namespace nix {
 
-/* How long a temp root stays valid, and how often the heartbeat renews this
-   node's temp roots. The interval must be comfortably below the TTL so a root
+/* How long a temp root stays valid without being renewed. While a path is
+   pinned (see TempRootPin) the heartbeat keeps renewing its row; after the
+   last pin is released the row simply lapses — so this TTL bounds both a
+   crashed node's leftovers and the post-operation reclaim latency.
+   Overridable for tests via NIX_TEMP_ROOT_TTL. */
+static uint64_t tempRootTtlSeconds()
+{
+    if (auto t = getEnv("NIX_TEMP_ROOT_TTL"))
+        if (auto n = string2Int<uint64_t>(*t))
+            return std::max<uint64_t>(*n, 3);
+    return 600;
+}
+
+/* The heartbeat interval must be comfortably below the TTL so a pinned root
    never lapses while its node is alive. */
-static constexpr uint64_t tempRootTtlSeconds = 600;
-static constexpr unsigned tempRootHeartbeatSeconds = 200;
+static uint64_t tempRootHeartbeatSeconds()
+{
+    return std::max<uint64_t>(1, std::min<uint64_t>(200, tempRootTtlSeconds() / 3));
+}
 
 /* How long a per-derivation build lock stays valid without a heartbeat; the
    same heartbeat that renews temp roots renews held build locks, so a build
@@ -127,18 +143,24 @@ DistributedStore::DistributedStore(ref<const Config> config)
     gethostname(host, sizeof(host) - 1);
     nodeId = std::string(host) + ":" + std::to_string(getpid());
 
-    /* Keep this node's temp roots alive for as long as the store is open. */
+    /* Keep the PINNED temp roots (paths in use by operations right now, see
+       TempRootPin) and held build locks alive for as long as they are held;
+       released paths' rows lapse via their TTL. */
     heartbeatThread = std::thread([this]() {
         std::unique_lock<std::mutex> lk(heartbeatMutex);
         while (!heartbeatStop) {
-            heartbeatCv.wait_for(lk, std::chrono::seconds(tempRootHeartbeatSeconds), [this]() {
+            heartbeatCv.wait_for(lk, std::chrono::seconds(tempRootHeartbeatSeconds()), [this]() {
                 return heartbeatStop;
             });
             if (heartbeatStop)
                 break;
             lk.unlock();
             try {
-                backend->renewTempRoots(nodeId, tempRootTtlSeconds);
+                {
+                    std::lock_guard<std::mutex> pinsLk(pinsMutex);
+                    for (auto & [path, _count] : pinnedPaths)
+                        backend->addTempRoot(nodeId, path, tempRootTtlSeconds());
+                }
                 backend->renewBuildLocks(nodeId, buildLockTtlSeconds);
             } catch (...) {
                 /* Don't let a transient database error kill the heartbeat. */
@@ -269,8 +291,9 @@ void DistributedStore::addToStore(
         throw Error(
             "cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
 
-    /* Protect the path from a concurrent collector on any node while we add it. */
-    addTempRoot(info.path);
+    /* Pin the path against a concurrent collector on any node for the whole
+       operation (renewed by the heartbeat however long the copy takes). */
+    auto tempRootPin = pinPath(info.path);
 
     if (!repair && isValidPath(info.path))
         return;
@@ -360,8 +383,9 @@ StorePath DistributedStore::addToStoreFromDump(
 
     auto dstPath = makeFixedOutputPathFromCA(name, desc);
 
-    /* Protect the path from a concurrent collector on any node. */
-    addTempRoot(dstPath);
+    /* Pin the path against a concurrent collector on any node for the whole
+       operation (renewed by the heartbeat however long the add takes). */
+    auto tempRootPin = pinPath(dstPath);
 
     if (!repair && isValidPath(dstPath))
         return dstPath;
@@ -495,6 +519,9 @@ void DistributedStore::collectGarbage(const GCOptions & options, GCResults & res
         results.bytesFreed += freed;
         results.paths.insert(printStorePath(p));
         deleted.insert(p);
+        /* Drop the in-memory metadata cache entry, or this (long-running)
+           process keeps answering queries for the deleted path. */
+        invalidatePathInfoCacheFor(p);
     }
 
     backend->removeValidPaths(deleted);
@@ -584,9 +611,43 @@ std::optional<TrustedFlag> DistributedStore::isTrustedClient()
     return Trusted;
 }
 
+DistributedStore::TempRootPin::TempRootPin(DistributedStore & store_, const StorePath & path_)
+    : store(&store_)
+    , path(path_)
+{
+    std::lock_guard<std::mutex> lk(store->pinsMutex);
+    if (store->pinnedPaths[*path]++ == 0)
+        /* First pin for this path: register synchronously, so the path is
+           protected cluster-wide by the time the pinning operation
+           proceeds. */
+        store->backend->addTempRoot(store->nodeId, *path, tempRootTtlSeconds());
+}
+
+DistributedStore::TempRootPin::~TempRootPin()
+{
+    if (!store)
+        return;
+    std::lock_guard<std::mutex> lk(store->pinsMutex);
+    auto it = store->pinnedPaths.find(*path);
+    if (it != store->pinnedPaths.end() && --it->second == 0)
+        store->pinnedPaths.erase(it);
+    /* The database row is deliberately left to lapse via its TTL rather than
+       deleted: it keeps covering the window between the operation finishing
+       and the client registering a permanent root, the way LocalStore's
+       connection-lifetime temp roots do. */
+}
+
+DistributedStore::TempRootPin DistributedStore::pinPath(const StorePath & path)
+{
+    return TempRootPin(*this, path);
+}
+
 void DistributedStore::addTempRoot(const StorePath & path)
 {
-    backend->addTempRoot(nodeId, path, tempRootTtlSeconds);
+    /* One-shot protection for callers without an operation scope (generic
+       Store machinery): the row is not renewed and lapses after the TTL.
+       Operations of this store itself hold TempRootPins instead. */
+    backend->addTempRoot(nodeId, path, tempRootTtlSeconds());
 }
 
 std::unique_ptr<BuildLock> DistributedStore::tryLockBuild(const StorePath & drvPath)

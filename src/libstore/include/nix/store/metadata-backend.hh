@@ -223,12 +223,6 @@ struct MetadataBackend
     virtual void addTempRoot(const std::string & node, const StorePath & path, uint64_t ttlSeconds) = 0;
 
     /**
-     * Push the expiry of all of `node`'s temporary roots forward by
-     * `ttlSeconds` (the heartbeat).
-     */
-    virtual void renewTempRoots(const std::string & node, uint64_t ttlSeconds) = 0;
-
-    /**
      * The set of all non-expired temporary roots across the whole cluster.
      */
     virtual StorePathSet queryLiveTempRoots() = 0;

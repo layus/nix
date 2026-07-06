@@ -651,13 +651,6 @@ void PostgresMetadataBackend::addTempRoot(const std::string & node, const StoreP
         {node, store.printStorePath(path), std::to_string(expires)}));
 }
 
-void PostgresMetadataBackend::renewTempRoots(const std::string & node, uint64_t ttlSeconds)
-{
-    auto lock = std::scoped_lock(mutex);
-    int64_t expires = (int64_t) time(nullptr) + (int64_t) ttlSeconds;
-    Result(execParams("update TempRoots set expires = $1 where node = $2", {std::to_string(expires), node}));
-}
-
 StorePathSet PostgresMetadataBackend::queryLiveTempRoots()
 {
     auto lock = std::scoped_lock(mutex);
