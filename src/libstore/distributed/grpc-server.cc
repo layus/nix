@@ -308,8 +308,16 @@ struct NixStoreServiceImpl : pb::NixStore::Service
         if (auto s = checkAuth(*ctx, token); !s.ok())
             return s;
         return guarded([&]() {
-            auto root =
-                require<LocalFSStore>(*store).addPermRoot(store->parseStorePath(req->store_path()), req->gc_root());
+            auto path = store->parseStorePath(req->store_path());
+            /* Stores that track roots by name (the distributed store's shared
+               database) take the client's name as-is — no filesystem root
+               anywhere. Fall back to a server-side filesystem root for
+               backing stores that don't (e.g. a daemon store). */
+            if (require<GcStore>(*store).addNamedRoot(req->gc_root(), path)) {
+                resp->set_value(req->gc_root());
+                return;
+            }
+            auto root = require<LocalFSStore>(*store).addPermRoot(path, req->gc_root());
             resp->set_value(root.string());
         });
     }

@@ -190,8 +190,10 @@ void PostgresMetadataBackend::initSchema()
         );
         create table if not exists GCRoots (
             link text primary key,
-            path text not null
+            path text not null,
+            registered bigint not null default 0
         );
+        alter table GCRoots add column if not exists registered bigint not null default 0;
         create index if not exists IndexGCRootsPath on GCRoots(path);
         create table if not exists GCLease (
             id      integer primary key,
@@ -568,9 +570,20 @@ void PostgresMetadataBackend::registerDrvOutput(const Realisation & info)
 void PostgresMetadataBackend::addRoot(const std::string & link, const StorePath & path)
 {
     auto lock = std::scoped_lock(mutex);
+    /* Roots are leases: re-adding refreshes the registration time. */
     Result(execParams(
-        "insert into GCRoots (link, path) values ($1, $2) on conflict (link) do update set path = excluded.path",
-        {link, store.printStorePath(path)}));
+        "insert into GCRoots (link, path, registered) values ($1, $2, $3) "
+        "on conflict (link) do update set path = excluded.path, registered = excluded.registered",
+        {link, store.printStorePath(path), std::to_string((int64_t) time(nullptr))}));
+}
+
+uint64_t PostgresMetadataBackend::removeRootsOlderThan(int64_t olderThan)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result res(execParams("delete from GCRoots where registered < $1 returning link", {std::to_string(olderThan)}));
+    for (int i = 0; i < res.ntuples(); ++i)
+        debug("expired GC root '%s'", res.get(i, 0));
+    return res.ntuples();
 }
 
 std::map<StorePath, std::set<std::string>> PostgresMetadataBackend::queryRoots()
@@ -654,6 +667,12 @@ StorePathSet PostgresMetadataBackend::queryLiveTempRoots()
     for (int i = 0; i < res.ntuples(); ++i)
         paths.insert(store.parseStorePath(res.get(i, 0)));
     return paths;
+}
+
+void PostgresMetadataBackend::removeTempRoots(const std::string & node)
+{
+    auto lock = std::scoped_lock(mutex);
+    Result(execParams("delete from TempRoots where node = $1", {node}));
 }
 
 bool PostgresMetadataBackend::acquireBuildLock(

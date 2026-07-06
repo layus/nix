@@ -157,6 +157,13 @@ DistributedStore::~DistributedStore()
     heartbeatCv.notify_all();
     if (heartbeatThread.joinable())
         heartbeatThread.join();
+    /* Release this node's temp roots on clean shutdown (as LocalStore's
+       lapse with the client connection); the TTL only bounds a crash. */
+    try {
+        backend->removeTempRoots(nodeId);
+    } catch (...) {
+        /* Losing the database on the way out is fine: the TTL reclaims them. */
+    }
 }
 
 void DistributedStore::anchor() {}
@@ -400,6 +407,12 @@ void DistributedStore::addIndirectRoot(const std::filesystem::path & gcRoot)
     backend->addRoot(gcRoot.string(), storePath);
 }
 
+bool DistributedStore::addNamedRoot(const std::string & name, const StorePath & storePath)
+{
+    backend->addRoot(name, storePath);
+    return true;
+}
+
 Roots DistributedStore::findRoots(bool censor)
 {
     Roots roots;
@@ -417,6 +430,15 @@ void DistributedStore::collectGarbage(const GCOptions & options, GCResults & res
     if (!backend->acquireGCLease(nodeId, /*ttlSeconds=*/3600))
         throw Error("another node is currently running garbage collection on this store");
     Finally releaseLease([&]() { backend->releaseGCLease(nodeId); });
+
+    /* Roots are leases (see `gc-root-lifetime`): drop the lapsed ones first,
+       so this same run reclaims the paths they were holding. */
+    if (options.action != GCOptions::gcReturnLive && options.action != GCOptions::gcReturnDead)
+        if (auto expired = backend->removeRootsOlderThan((int64_t) time(nullptr) - (int64_t) config->gcRootLifetime))
+            printInfo(
+                "removed %d expired GC root(s) (not refreshed within the %d s gc-root-lifetime)",
+                expired,
+                (uint64_t) config->gcRootLifetime);
 
     /* Mark: the live set is the closure, over references, of all cluster
        roots *and* every non-expired temp root (paths in use on any node). */

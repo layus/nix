@@ -645,6 +645,30 @@ struct GrpcStore : virtual Store, virtual GcStore
         return *result;
     }
 
+    bool addNamedRoot(const std::string & name, const StorePath & storePath) override
+    {
+        /* Qualify the name with the client hostname: many clients may name a
+           root after the same local path (e.g. ./result). The server-side
+           root is a lease (see the distributed store's `gc-root-lifetime`):
+           re-adding it — e.g. re-running `nix build` on the same out-link —
+           refreshes it. */
+        char host[256];
+        if (gethostname(host, sizeof(host)) != 0)
+            throw SysError("getting the hostname for GC root registration");
+        host[sizeof(host) - 1] = 0;
+
+        pb::AddPermRootRequest req;
+        req.set_store_path(printStorePath(storePath));
+        req.set_gc_root(fmt("%s:%s", host, name));
+        pb::StringReply resp;
+        withFailover([&](pb::NixStore::Stub & stub) {
+            grpc::ClientContext ctx;
+            auth(ctx);
+            return stub.AddPermRoot(&ctx, req, &resp);
+        });
+        return true;
+    }
+
     Roots findRoots(bool censor) override
     {
         pb::Empty req;

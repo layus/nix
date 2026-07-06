@@ -79,12 +79,14 @@ struct PostgresMetadataBackend : MetadataBackend
 
     void addRoot(const std::string & link, const StorePath & path) override;
     std::map<StorePath, std::set<std::string>> queryRoots() override;
+    uint64_t removeRootsOlderThan(int64_t olderThan) override;
     void removeValidPaths(const StorePathSet & paths) override;
     bool acquireGCLease(const std::string & holder, uint64_t ttlSeconds) override;
     void releaseGCLease(const std::string & holder) override;
     void addTempRoot(const std::string & node, const StorePath & path, uint64_t ttlSeconds) override;
     void renewTempRoots(const std::string & node, uint64_t ttlSeconds) override;
     StorePathSet queryLiveTempRoots() override;
+    void removeTempRoots(const std::string & node) override;
     bool acquireBuildLock(const std::string & drvPath, const std::string & holder, uint64_t ttlSeconds) override;
     void releaseBuildLock(const std::string & drvPath, const std::string & holder) override;
     void renewBuildLocks(const std::string & holder, uint64_t ttlSeconds) override;

@@ -237,6 +237,36 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       need cluster-wide coordination). Runtime-validated on a live node:
       clean store passes, a corrupted file and a removed path are both
       reported (exit 1), repair is refused.
+- [x] **GC roots are leases with a server-defined lifetime.** In a
+      distributed setup roots are registered remotely by clients that may
+      disappear without ever cleaning them up, so hard-coding them forever
+      makes no sense. `GCRoots` rows now carry a `registered` timestamp;
+      adding a root that already exists refreshes it; and the collector
+      deletes roots not refreshed within the store's new `gc-root-lifetime`
+      setting (default one week), reclaiming the paths they held in the same
+      run. Clients register roots over gRPC: a new `GcStore::addNamedRoot`
+      seam (default: unsupported) is implemented by `DistributedStore`
+      (database upsert, no filesystem symlink) and by the `grpc://` client
+      (the previously-unused `AddPermRoot` RPC, root name qualified with the
+      client hostname); the out-link code in libcmd — which only registered
+      roots for `LocalFSStore`s, so remote stores never got any — now also
+      creates the local `result` symlink and registers/refreshes the named
+      root for such stores. `nix store gc --max` and `nix-collect-garbage`
+      work over `grpc://` (`--max-freed` is honoured mid-sweep;
+      `--delete-older-than` composes: deleted profile generations simply stop
+      refreshing their leases and lapse). Also fixed en route: a node now
+      **releases its temp roots on clean shutdown** (they used to pin every
+      path the node ever touched until 600 s after a crash-style exit, making
+      GC reclaim nearly impossible on a live cluster — the TTL now only
+      bounds a crash). Runtime-validated end-to-end: build `-o` over gRPC
+      creates the local symlink + hostname-qualified DB root, re-building
+      refreshes `registered`, GC logs `removed 1 expired GC root(s)` after
+      the lifetime, and after a graceful node restart the next GC physically
+      reclaims the path.
+- [ ] Roots pinned by a *live* node's temp roots are still not collectable
+      until that node restarts (the heartbeat renews all of a node's temp
+      roots indefinitely). Scoping temp-root renewal to in-flight operations
+      only is the remaining GC-precision work.
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).

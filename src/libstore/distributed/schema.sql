@@ -80,12 +80,19 @@ create index if not exists IndexRealisations on Realisations(drvPath, outputName
 
 -- Garbage-collector roots, shared across the whole cluster. Each row roots a
 -- store path; `link` is the cluster-unique identifier of the root (e.g. the
--- absolute path of a gcroots symlink). This replaces the per-node gcroots
--- directory scan: every node registers its roots here and the collector reads
--- the union.
+-- absolute path of a gcroots symlink, qualified with the client hostname for
+-- remote clients). This replaces the per-node gcroots directory scan: every
+-- node registers its roots here and the collector reads the union.
+--
+-- Roots behave as LEASES: clients register them remotely and may disappear
+-- without ever cleaning them up, so `registered` records the last
+-- (re-)registration (adding an existing root refreshes it) and the collector
+-- deletes roots older than the store's `gc-root-lifetime` (one week by
+-- default) before marking, reclaiming the paths they held in the same run.
 create table if not exists GCRoots (
     link text primary key,
-    path text not null
+    path text not null,
+    registered bigint not null default 0           -- epoch seconds of the last (re-)registration
 );
 
 create index if not exists IndexGCRootsPath on GCRoots(path);

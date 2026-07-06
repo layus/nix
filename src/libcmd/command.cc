@@ -7,7 +7,9 @@
 #include "nix/store/globals.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/local-fs-store.hh"
+#include "nix/store/gc-store.hh"
 #include "nix/store/derivations.hh"
+#include "nix/util/file-system.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/store/profiles.hh"
 #include "nix/cmd/repl.hh"
@@ -443,11 +445,57 @@ void MixOutLinkBase::createOutLinksMaybe(const std::vector<BuiltPathWithResult> 
     createOutLinksMaybe(toBuiltPaths(buildables), store);
 }
 
+/* Like `createOutLinks`, but for stores reached over the network that track
+   GC roots by name (`GcStore::addNamedRoot`) rather than through a shared
+   filesystem: register/refresh a root named after each out-link's absolute
+   path, and create the local result symlinks (they may dangle locally — the
+   paths live in the remote store). Stores without named roots get neither
+   (the historical behaviour for remote stores). */
+static void createOutLinksRemote(const std::filesystem::path & outLink, const BuiltPaths & buildables, GcStore & store)
+{
+    auto oneLink = [&](const std::filesystem::path & symlink, const StorePath & path) {
+        if (!store.addNamedRoot(absPath(symlink).string(), path))
+            return false;
+        replaceSymlink(std::filesystem::path(store.printStorePath(path)), symlink);
+        return true;
+    };
+    for (const auto & [_i, buildable] : enumerate(buildables)) {
+        auto i = _i;
+        auto ok = std::visit(
+            overloaded{
+                [&](const BuiltPath::Opaque & bo) {
+                    auto symlink = outLink;
+                    if (i)
+                        symlink += fmt("-%d", i);
+                    return oneLink(symlink, bo.path);
+                },
+                [&](const BuiltPath::Built & bfd) {
+                    for (auto & output : bfd.outputs) {
+                        auto symlink = outLink;
+                        if (i)
+                            symlink += fmt("-%d", i);
+                        if (output.first != "out")
+                            symlink += fmt("-%s", output.first);
+                        if (!oneLink(symlink, output.second))
+                            return false;
+                    }
+                    return true;
+                },
+            },
+            buildable.raw());
+        if (!ok)
+            return;
+    }
+}
+
 void MixOutLinkBase::createOutLinksMaybe(const BuiltPaths & paths, ref<Store> & store)
 {
-    if (outLink)
+    if (outLink) {
         if (auto store2 = store.dynamic_pointer_cast<LocalFSStore>())
             createOutLinks(*outLink, paths, *store2);
+        else if (auto gcStore = store.dynamic_pointer_cast<GcStore>())
+            createOutLinksRemote(*outLink, paths, *gcStore);
+    }
 }
 
 void MixPrintOutPaths::printOutPathsMaybe(const BuiltPaths & paths, ref<Store> store)

@@ -70,6 +70,9 @@ NIXBLD_N=${NIXBLD_N:-4}
 # Registration freshness TTL for the nodes (heartbeat = TTL/3). Short, so the
 # stale-registration sweep is observable within the test.
 REPLICA_TTL=${REPLICA_TTL:-6}
+# GC-root lease lifetime (defaults to one week in production). Short, so root
+# expiry is observable within the test.
+ROOT_LIFETIME=${ROOT_LIFETIME:-5}
 
 nix_cmd=("$NIX" --extra-experimental-features 'nix-command flakes')
 
@@ -112,7 +115,7 @@ echo "   CockroachDB ready, database '$DB' created"
 
 DBURL="postgresql://root@cockroach:26257/$DB"
 # The share is mounted at /cluster; the store lives in its /store subdir.
-BACKING="distributed://?metadata-db-url=$DBURL&real=/cluster/store"
+BACKING="distributed://?metadata-db-url=$DBURL&real=/cluster/store&gc-root-lifetime=$ROOT_LIFETIME"
 
 # ---------------------------------------------------------------------------
 # node helpers (same recipe as stress-test.sh, share mounted at /cluster)
@@ -323,6 +326,42 @@ if "${nix_cmd[@]}" path-info --store "$CLUSTER" "$OUT" >/dev/null 2>&1; then
 else
   echo "!!! path-info via the registry-discovering cluster URI failed"; fail=1
 fi
+
+# ---------------------------------------------------------------------------
+# GC roots are leases: registered remotely, refreshed on re-add, expired by GC
+# ---------------------------------------------------------------------------
+echo
+echo "== GC roots as leases (gc-root-lifetime=${ROOT_LIFETIME}s) =="
+ROOTLINK=$(mktemp -u /tmp/simple-root.XXXXXX)
+reg_time() {
+  docker exec cockroach cockroach sql --insecure -d "$DB" --format tsv \
+    -e "select coalesce(max(registered), 0) from GCRoots where link like '%$(basename "$ROOTLINK")'" \
+    2>/dev/null | tail -1
+}
+# Building with -o against the gRPC store must create the local symlink AND
+# register a hostname-qualified root in the shared database.
+timeout 60 "${nix_cmd[@]}" build --store "$N1" -o "$ROOTLINK" "$DRV^*" >/dev/null 2>&1 || true
+[ -L "$ROOTLINK" ] \
+  && echo "   OK: local result symlink created ($ROOTLINK)" \
+  || { echo "!!! no local result symlink"; fail=1; }
+R1=$(reg_time)
+[ "${R1:-0}" -gt 0 ] \
+  && echo "   OK: root registered in the shared DB (registered=$R1)" \
+  || { echo "!!! root not registered in GCRoots"; fail=1; }
+# Re-adding the same root refreshes its lease.
+sleep 2
+timeout 60 "${nix_cmd[@]}" build --store "$N1" -o "$ROOTLINK" "$DRV^*" >/dev/null 2>&1 || true
+R2=$(reg_time)
+[ "${R2:-0}" -gt "${R1:-0}" ] \
+  && echo "   OK: re-adding refreshed the lease ($R1 -> $R2)" \
+  || { echo "!!! lease not refreshed ($R1 -> $R2)"; fail=1; }
+# A root not refreshed within the lifetime is deleted by the next GC.
+sleep $((ROOT_LIFETIME + 1))
+timeout 60 "${nix_cmd[@]}" store gc --store "$N2" >/dev/null 2>&1 || true
+[ "$(reg_time)" = 0 ] \
+  && echo "   OK: expired root removed by GC" \
+  || { echo "!!! expired root still present after GC"; fail=1; }
+rm -f "$ROOTLINK"
 
 # ---------------------------------------------------------------------------
 # error fidelity: a failing remote build behaves exactly like a local one

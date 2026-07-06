@@ -175,7 +175,9 @@ struct MetadataBackend
 
     /**
      * Register `path` as rooted by `link` (a cluster-unique root identifier).
-     * Upsert: re-registering the same link repoints it.
+     * Upsert: re-registering the same link repoints it and refreshes its
+     * registration time — roots behave as leases (see
+     * `removeRootsOlderThan`).
      */
     virtual void addRoot(const std::string & link, const StorePath & path) = 0;
 
@@ -184,6 +186,15 @@ struct MetadataBackend
      * rooted store path to the set of root identifiers rooting it.
      */
     virtual std::map<StorePath, std::set<std::string>> queryRoots() = 0;
+
+    /**
+     * Delete every GC root whose last (re-)registration is older than
+     * `olderThan` (epoch seconds), returning how many were removed. Roots
+     * are leases: remote clients may disappear without ever cleaning up
+     * their roots, so the collector calls this (with now minus the store's
+     * `gc-root-lifetime`) before marking.
+     */
+    virtual uint64_t removeRootsOlderThan(int64_t olderThan) = 0;
 
     /**
      * Atomically remove a set of paths (and all their references) from the
@@ -221,6 +232,13 @@ struct MetadataBackend
      * The set of all non-expired temporary roots across the whole cluster.
      */
     virtual StorePathSet queryLiveTempRoots() = 0;
+
+    /**
+     * Remove all of `node`'s temporary roots. Called on clean shutdown so a
+     * node's temp roots do not outlive it by their TTL (the TTL only bounds
+     * a crashed node).
+     */
+    virtual void removeTempRoots(const std::string & node) = 0;
 
     /**
      * Try to acquire the cluster-wide exclusive build lock for derivation

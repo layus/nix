@@ -46,6 +46,20 @@ struct DistributedStoreConfig : virtual LocalStoreConfig
           `host=db.example.com dbname=nix user=nix`.
         )"};
 
+    Setting<uint64_t> gcRootLifetime{
+        this,
+        7 * 24 * 3600,
+        "gc-root-lifetime",
+        R"(
+          How long (in seconds) a registered GC root stays alive without
+          being re-registered — one week by default. In a distributed setup
+          roots are registered remotely by clients that may disappear without
+          ever cleaning them up, so roots behave as *leases*: adding a root
+          that already exists refreshes it, and the garbage collector deletes
+          roots that have not been refreshed within this lifetime, reclaiming
+          the paths they held in the same run.
+        )"};
+
     static const std::string name()
     {
         return "Distributed Store";
@@ -126,6 +140,10 @@ struct DistributedStore : virtual LocalStore
     /* `addPermRoot` is `final` in IndirectRootStore; it creates the user-facing
        symlink and calls this, which records the root in the shared database. */
     void addIndirectRoot(const std::filesystem::path & path) override;
+    /* Remote clients register roots by name (no symlink anywhere on the
+       shared filesystem); re-adding refreshes the root's lease (see
+       `gc-root-lifetime`). */
+    bool addNamedRoot(const std::string & name, const StorePath & storePath) override;
 
     /**
      * Verify the store against the shared database (NOT the vestigial

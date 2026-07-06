@@ -132,6 +132,21 @@ public:
     virtual Roots findRoots(bool censor) = 0;
 
     /**
+     * Register (or refresh) a permanent GC root for `storePath` under a
+     * caller-chosen name, without requiring a filesystem shared with the
+     * store — the remote-friendly counterpart of `LocalFSStore::addPermRoot`
+     * (see the class comment above for why that one cannot live here).
+     * Stores that track roots remotely (e.g. in a distributed store's shared
+     * database) override this; such roots typically have a server-defined
+     * lifetime and must be refreshed by re-adding them. Returns false when
+     * the store offers no way to register named roots (the default).
+     */
+    virtual bool addNamedRoot(const std::string & name, const StorePath & storePath)
+    {
+        return false;
+    }
+
+    /**
      * Perform a garbage collection.
      */
     virtual void collectGarbage(const GCOptions & options, GCResults & results) = 0;
