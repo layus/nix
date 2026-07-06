@@ -311,6 +311,14 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
 - [ ] Stolen-build log lines go to the stealer's server log and can
       interleave into a concurrent RPC build's stream (the logger is
       process-global).
+- [ ] **Same-node double-build hole (theoretical).** The cluster build lock
+      is per-*node* (`holder = nodeId`, deliberately re-entrant so a goal can
+      re-acquire), so two Workers in one server process — e.g. an
+      RPC-initiated build and a stolen build of the same derivation — can
+      both "hold" it. The machine-local `PathLocks` are supposed to exclude
+      them, but they use `flock`, whose semantics degrade over NFS (server-
+      side POSIX emulation is per-process). Fix: make the lock holder unique
+      per acquisition (nodeId + token) and renew by prefix.
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).
