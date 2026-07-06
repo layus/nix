@@ -124,9 +124,13 @@ create index if not exists IndexTempRootsExpires on TempRoots(expires);
 -- at once. A node claims the row for a drv when it is unheld or its holder's
 -- lease has expired; `expires` (epoch seconds) bounds a crashed builder. The
 -- holder renews via a heartbeat and deletes the row when the build finishes.
+-- (Also used, keyed by output store path, as the cluster-wide lease that
+-- serialises writers of one path across all nodes and workers — the
+-- replicated-database replacement for flock, which is unreliable on shared
+-- (NFS) filesystems.)
 create table if not exists BuildLocks (
-    drv_path text primary key,                     -- the derivation being built
-    holder   text,                                 -- node id currently building it
+    drv_path text primary key,                     -- the lock key (a .drv path, or a store path for write leases)
+    holder   text,                                 -- unique per acquisition: <nodeId>#<token>
     expires  bigint not null                       -- epoch seconds when it lapses
 );
 

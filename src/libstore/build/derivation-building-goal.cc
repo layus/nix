@@ -463,7 +463,8 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
         std::set<std::filesystem::path> lockFiles;
         /* FIXME: Should lock something like the drv itself so we don't build same
            CA drv concurrently */
-        if (auto * localStore = dynamic_cast<LocalStore *>(&worker.store)) {
+        if (auto * localStore = dynamic_cast<LocalStore *>(&worker.store);
+            localStore && worker.store.useFileSystemBuildLocks()) {
             /* If we aren't a local store, we might need to use the local store as
                a build remote, but that would cause a deadlock. */
             /* FIXME: Make it so we can use ourselves as a build remote even if we

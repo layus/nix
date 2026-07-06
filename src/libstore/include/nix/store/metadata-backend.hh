@@ -249,10 +249,12 @@ struct MetadataBackend
     virtual void releaseBuildLock(const std::string & drvPath, const std::string & holder) = 0;
 
     /**
-     * Push the expiry of every build lock held by `holder` forward by
-     * `ttlSeconds` (the heartbeat), so a long build does not lose its lock.
+     * Push the expiry of every lock whose holder starts with
+     * `holderPrefix#` forward (the heartbeat), so a long build does not
+     * lose its lock. Holders are unique per acquisition —
+     * `<nodeId>#<token>` — so a node renews all of its own holders at once.
      */
-    virtual void renewBuildLocks(const std::string & holder, uint64_t ttlSeconds) = 0;
+    virtual void renewBuildLocks(const std::string & holderPrefix, uint64_t ttlSeconds) = 0;
 
     /**
      * Advertise `drvPath` as ready to build (all of its inputs are valid),

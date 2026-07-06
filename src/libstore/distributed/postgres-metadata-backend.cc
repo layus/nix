@@ -706,11 +706,16 @@ void PostgresMetadataBackend::releaseBuildLock(const std::string & drvPath, cons
     Result(execParams("delete from BuildLocks where drv_path = $1 and holder = $2", {drvPath, holder}));
 }
 
-void PostgresMetadataBackend::renewBuildLocks(const std::string & holder, uint64_t ttlSeconds)
+void PostgresMetadataBackend::renewBuildLocks(const std::string & holderPrefix, uint64_t ttlSeconds)
 {
     auto lock = std::scoped_lock(mutex);
     int64_t expires = (int64_t) time(nullptr) + (int64_t) ttlSeconds;
-    Result(execParams("update BuildLocks set expires = $1 where holder = $2", {std::to_string(expires), holder}));
+    /* Holders are unique per acquisition (nodeId#token); the heartbeat renews
+       all of its node's holders by prefix. `left(...)` rather than LIKE, so
+       hostnames containing wildcard characters need no escaping. */
+    Result(execParams(
+        "update BuildLocks set expires = $1 where left(holder, length($2)) = $2",
+        {std::to_string(expires), holderPrefix + "#"}));
 }
 
 void PostgresMetadataBackend::advertiseBuild(const std::string & node, const std::string & drvPath, uint64_t ttlSeconds)

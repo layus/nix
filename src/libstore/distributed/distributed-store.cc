@@ -73,12 +73,14 @@ struct DistributedBuildLock : BuildLock
         , holder(std::move(holder))
         , activeBuilds(activeBuilds)
     {
-        ++*activeBuilds;
+        if (activeBuilds)
+            ++*activeBuilds;
     }
 
     ~DistributedBuildLock() override
     {
-        --*activeBuilds;
+        if (activeBuilds)
+            --*activeBuilds;
         try {
             backend->releaseBuildLock(drvPath, holder);
         } catch (...) {
@@ -331,11 +333,10 @@ void DistributedStore::addToStore(
     if (!repair && isValidPath(info.path))
         return;
 
-    /* Lock the output path against concurrent writers on this node. (Content
-       is content-addressed, so concurrent writers on other nodes converge.) */
+    /* Lock the path against concurrent writers on ANY node, through the
+       replicated database (flock on the shared filesystem is unreliable). */
     auto realPath = toRealPath(info.path);
-    PathLocks outputLock;
-    outputLock.lockPaths({realPath.string()});
+    auto outputLock = lockClusterKey(printStorePath(info.path));
 
     /* It may have become valid in the meantime. */
     if (!repair && isValidPathUncached(info.path))
@@ -376,7 +377,7 @@ void DistributedStore::addToStore(
        registered (the build needs it). */
     registerValidPaths(ValidPathInfos{{info.path, info}});
 
-    outputLock.setDeletion(true);
+    /* (DB lease releases on scope exit; no lock file to clean up.) */
 }
 
 StorePath DistributedStore::addToStoreFromDump(
@@ -423,8 +424,9 @@ StorePath DistributedStore::addToStoreFromDump(
     if (!repair && isValidPath(dstPath))
         return dstPath;
 
+    /* As in addToStore: a database lease, not flock, guards the write. */
     auto realPath = toRealPath(dstPath);
-    PathLocks outputLock({realPath.string()});
+    auto outputLock = lockClusterKey(printStorePath(dstPath));
 
     if (!repair && isValidPathUncached(dstPath))
         return dstPath;
@@ -451,7 +453,7 @@ StorePath DistributedStore::addToStoreFromDump(
        map registered. */
     registerValidPaths(ValidPathInfos{{info.path, info}});
 
-    outputLock.setDeletion(true);
+    /* (DB lease releases on scope exit; no lock file to clean up.) */
     return dstPath;
 }
 
@@ -685,10 +687,40 @@ void DistributedStore::addTempRoot(const StorePath & path)
 
 std::unique_ptr<BuildLock> DistributedStore::tryLockBuild(const StorePath & drvPath)
 {
+    /* The holder is unique PER ACQUISITION (nodeId + token), not per node:
+       with a plain per-node holder a second worker on the same node — e.g.
+       an RPC build and a stolen build of the same derivation — would be
+       granted the "already ours" re-entrant acquire and double-build. The
+       heartbeat renews all of this node's holders by prefix. */
     auto drv = printStorePath(drvPath);
-    if (!backend->acquireBuildLock(drv, nodeId, buildLockTtlSeconds))
-        return nullptr; // another node is building this derivation
-    return std::make_unique<DistributedBuildLock>(backend.get(), std::move(drv), nodeId, &activeLocalBuilds);
+    auto holder = fmt("%s#%d", nodeId, lockCounter++);
+    if (!backend->acquireBuildLock(drv, holder, buildLockTtlSeconds))
+        return nullptr; // another worker (any node, ours included) is building this derivation
+    return std::make_unique<DistributedBuildLock>(backend.get(), std::move(drv), std::move(holder), &activeLocalBuilds);
+}
+
+bool DistributedStore::useFileSystemBuildLocks()
+{
+    /* flock semantics are unreliable on the shared (NFS) filesystem this
+       store lives on, and tryLockBuild above already provides full exclusion
+       through the replicated database. */
+    return false;
+}
+
+std::unique_ptr<BuildLock> DistributedStore::lockClusterKey(std::string key)
+{
+    /* A cluster-wide exclusive lease on an arbitrary key (kept in the same
+       BuildLocks table as the per-derivation build locks), waiting until it
+       is granted. Serialises writers of one store path across ALL nodes and
+       workers — the replicated-database replacement for the flock PathLocks,
+       which are unreliable on shared (NFS) filesystems. Kept alive by the
+       heartbeat, reclaimed by TTL after a crash. */
+    auto holder = fmt("%s#%d", nodeId, lockCounter++);
+    while (!backend->acquireBuildLock(key, holder, buildLockTtlSeconds)) {
+        checkInterrupt();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    return std::make_unique<DistributedBuildLock>(backend.get(), std::move(key), std::move(holder), nullptr);
 }
 
 /* ------------------------------------------------------------------ *

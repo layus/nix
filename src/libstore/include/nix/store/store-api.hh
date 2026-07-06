@@ -810,6 +810,19 @@ public:
     }
 
     /**
+     * Whether builds on this store still need the machine-local (flock)
+     * output-path locks. Stores whose `tryLockBuild` provides full exclusion
+     * on its own — across nodes AND across workers within one process, e.g.
+     * via entries in a replicated database — return false: flock is not
+     * only redundant there, its semantics are unreliable on the shared (NFS)
+     * filesystems such stores live on.
+     */
+    virtual bool useFileSystemBuildLocks()
+    {
+        return true;
+    }
+
+    /**
      * Like buildPaths(), but return a vector of \ref BuildResult
      * BuildResults corresponding to each element in paths. Note that in
      * case of a build/substitution error, this function won't throw an

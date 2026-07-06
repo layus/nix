@@ -236,12 +236,20 @@ struct DistributedStore : virtual LocalStore
     void addTempRoot(const StorePath & path) override;
 
     /**
-     * Acquire the cluster-wide per-derivation build lock in the database, so no
-     * two nodes build the same derivation at once. Returns a handle that
-     * releases the lock when destroyed, or `nullptr` if another node currently
-     * holds it. Held locks are kept alive by the heartbeat thread.
+     * Acquire the cluster-wide per-derivation build lock in the database, so
+     * no two workers — on any node, this one included (the holder is unique
+     * per acquisition) — build the same derivation at once. Returns a handle
+     * that releases the lock when destroyed, or `nullptr` if another worker
+     * currently holds it. Held locks are kept alive by the heartbeat thread.
      */
     std::unique_ptr<BuildLock> tryLockBuild(const StorePath & drvPath) override;
+
+    /**
+     * Build exclusion comes entirely from `tryLockBuild`'s database entries;
+     * the machine-local flock output locks are skipped (flock is unreliable
+     * on the shared filesystem).
+     */
+    bool useFileSystemBuildLocks() override;
 
     /**
      * Advertise a ready-to-build derivation in the shared `BuildQueue`, so
@@ -284,6 +292,13 @@ private:
     /** Number of builds this node is currently running (live build-lock
         handles); the work stealer only runs at zero. */
     std::atomic<unsigned> activeLocalBuilds{0};
+
+    /** Makes lock holders unique per acquisition (nodeId#token). */
+    std::atomic<uint64_t> lockCounter{0};
+
+    /** Cluster-wide exclusive lease on an arbitrary key, waiting until
+        granted — the database replacement for flock PathLocks. */
+    std::unique_ptr<BuildLock> lockClusterKey(std::string key);
 
     /** Background work stealer (only started with `work-stealing`). */
     std::thread stealerThread;
