@@ -528,10 +528,6 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
                     logFollower->poll();
                 co_await waitForAWhile();
             }
-        if (logFollower) {
-            logFollower->poll();
-            logFollower.reset();
-        }
 
         /* Now check again whether the outputs are valid.  This is because
            another process may have started building in parallel.  After
@@ -544,11 +540,26 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
 
         if (buildMode != bmCheck && allValid) {
             debug("skipping build of derivation '%s', someone beat us to it", worker.store.printStorePath(drvPath));
+            /* The build our requester asked for just happened elsewhere:
+               make sure they still see its log. If we followed it while
+               waiting on the lock this drains the tail; if the result
+               arrived before we ever waited, it replays the stored log. */
+            if (!logFollower)
+                logFollower = worker.store.followBuildLog(drvPath);
+            if (logFollower)
+                logFollower->poll();
             outputLocks.setDeletion(true);
             outputLocks.unlock();
             buildLock.reset(); // release the cluster build lock; we didn't build
             done = true;
             co_return Return{};
+        }
+
+        /* We will build it ourselves: drain whatever a previous (failed)
+           holder logged, then stop following. */
+        if (logFollower) {
+            logFollower->poll();
+            logFollower.reset();
         }
 
         /* If any of the outputs already exist but are not valid, delete

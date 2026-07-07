@@ -331,23 +331,18 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       the same slow derivation fired at both nodes shows the builder's
       marker lines in BOTH clients' output, and `nix log` returns the stored
       log.
-- [ ] Cosmetic logger-routing residue (the substance is fixed: a stolen
-      build's log reaches its requester through the shared `BuildLogs`
-      follower, and `nix log` serves it from any node). What remains: on the
-      *stealer's* node the stolen build's logger events still go through the
-      process-global logger, so they can interleave into an unrelated RPC
-      build's client stream on that node; and a goal that never reaches the
-      lock wait (the stolen result arrived first) takes the "someone beat us
-      to it" path without replaying the log live. A thread-local logger
-      override would fix the former.
-- [ ] **Same-node double-build hole (theoretical).** The cluster build lock
-      is per-*node* (`holder = nodeId`, deliberately re-entrant so a goal can
-      re-acquire), so two Workers in one server process — e.g. an
-      RPC-initiated build and a stolen build of the same derivation — can
-      both "hold" it. The machine-local `PathLocks` are supposed to exclude
-      them, but they use `flock`, whose semantics degrade over NFS (server-
-      side POSIX emulation is per-process). Fix: make the lock holder unique
-      per acquisition (nodeId + token) and renew by prefix.
+- [x] **Logger-routing residue fixed.** `GrpcLogger` now forwards only the
+      events belonging to its own RPC — plain log messages routed by thread
+      (the RPC's build Worker runs entirely in the handler thread), activity
+      events by whether the activity was started in it — and passes
+      everything else through to the previous (server) logger. A concurrent
+      stolen build on the same node can no longer interleave into an
+      unrelated client's stream, and its own lines land in the server log
+      even mid-RPC. The "someone beat us to it" path also replays the stored
+      log now (one-shot follower), so a requester whose build finished
+      elsewhere before its goal ever reached the lock wait still sees the
+      log. Validated: a bystander client building on the stealer node during
+      a steal sees none of the stolen build's marker lines.
 - [ ] Runtime (`/proc`) roots: a per-node agent reporting paths held by
       running processes into `TempRoots`, for processes that hold a path
       without going through `addTempRoot` (defence in depth).

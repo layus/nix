@@ -341,7 +341,7 @@ let dep = n: derivation {
   name = "steal-dep-${n}";
   system = builtins.currentSystem;
   builder = "/bin/sh";
-  args = [ "-c" "j=0; while [ $j -lt 20000000 ]; do j=$((j+1)); done; echo ${n} > $out" ];
+  args = [ "-c" "echo steal-dep-noise-${n}; j=0; while [ $j -lt 20000000 ]; do j=$((j+1)); done; echo ${n} > $out" ];
 }; in builtins.unsafeDiscardStringContext (derivation {
   name = "steal-top";
   system = builtins.currentSystem;
@@ -359,7 +359,32 @@ SOUT=$(set +o pipefail; "${nix_cmd[@]}" derivation show "$SDRV" 2>/dev/null \
 # Fire at node1 ONLY: it builds one dep (its single slot), advertises the
 # other, and the idle node2 must steal it.
 timeout "$BUILD_TIMEOUT" "${nix_cmd[@]}" build --no-link --store "$N1" "$SDRV^*" \
-  >/tmp/simple-steal.out 2>/tmp/simple-steal.err || true
+  >/tmp/simple-steal.out 2>/tmp/simple-steal.err & steal_pid=$!
+# Meanwhile, a BYSTANDER client asks node2 for an unrelated build while node2
+# is busy with the stolen one. Its stream must stay clean: the stolen build's
+# logger events route to node2's server log, not into this client's stream
+# (GrpcLogger forwards only its own RPC's events).
+sleep 3
+BEXPR=$(cat <<'NIXEXPR'
+builtins.unsafeDiscardStringContext (derivation {
+  name = "bystander";
+  system = builtins.currentSystem;
+  builder = "/bin/sh";
+  args = [ "-c" "echo bystander-ran > $out" ];
+}).drvPath
+NIXEXPR
+)
+BDRV=$("${nix_cmd[@]}" eval --raw --impure --expr "$BEXPR")
+"${nix_cmd[@]}" copy --no-check-sigs --derivation --to "$N2" "$BDRV" >/dev/null 2>&1
+timeout "$BUILD_TIMEOUT" "${nix_cmd[@]}" build --no-link -L --store "$N2" "$BDRV^*" \
+  >/dev/null 2>/tmp/simple-bystander.err || true
+wait "$steal_pid" || true
+if grep -q 'steal-dep-noise' /tmp/simple-bystander.err; then
+  echo "!!! stolen-build lines leaked into the bystander client's stream:"
+  grep 'steal-dep-noise' /tmp/simple-bystander.err | head -3; fail=1
+else
+  echo "   OK: no stolen-build lines in the bystander client's stream"
+fi
 if "${nix_cmd[@]}" path-info --store "$N2" "$SOUT" >/dev/null 2>&1; then
   echo "   OK: the full closure built and is valid cluster-wide"
 else
