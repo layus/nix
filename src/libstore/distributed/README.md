@@ -331,9 +331,15 @@ Same host prerequisites as `stress-test.sh`; run from the repo root:
       the same slow derivation fired at both nodes shows the builder's
       marker lines in BOTH clients' output, and `nix log` returns the stored
       log.
-- [ ] Stolen-build log lines go to the stealer's server log and can
-      interleave into a concurrent RPC build's stream (the logger is
-      process-global).
+- [ ] Cosmetic logger-routing residue (the substance is fixed: a stolen
+      build's log reaches its requester through the shared `BuildLogs`
+      follower, and `nix log` serves it from any node). What remains: on the
+      *stealer's* node the stolen build's logger events still go through the
+      process-global logger, so they can interleave into an unrelated RPC
+      build's client stream on that node; and a goal that never reaches the
+      lock wait (the stolen result arrived first) takes the "someone beat us
+      to it" path without replaying the log live. A thread-local logger
+      override would fix the former.
 - [ ] **Same-node double-build hole (theoretical).** The cluster build lock
       is per-*node* (`holder = nodeId`, deliberately re-entrant so a goal can
       re-acquire), so two Workers in one server process — e.g. an
